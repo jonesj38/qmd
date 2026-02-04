@@ -77,7 +77,21 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
+import {
+  disposeDefaultLlamaCpp,
+  getDefaultLlamaCpp,
+  getDefaultEmbeddingLLM,
+  isUsingOpenAI,
+  setDefaultLlamaCpp,
+  setEmbeddingConfig,
+  pullModels,
+  withLLMSession,
+  DEFAULT_EMBED_MODEL_URI,
+  DEFAULT_GENERATE_MODEL_URI,
+  DEFAULT_RERANK_MODEL_URI,
+  DEFAULT_MODEL_CACHE_DIR,
+  LlamaCpp,
+} from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -97,6 +111,7 @@ import {
   listAllContexts,
   setConfigIndexName,
   loadConfig,
+  getEmbeddingConfig as getEmbeddingConfigFromYaml,
 } from "../collections.js";
 import { getEmbeddedQmdSkillContent, getEmbeddedQmdSkillFiles } from "../embedded-skills.js";
 
@@ -2817,6 +2832,18 @@ if (isMain) {
   if (!cli.command || cli.values.help) {
     showHelp();
     process.exit(cli.values.help ? 0 : 1);
+  }
+
+  // Load embedding configuration from config file
+  const embeddingYamlConfig = getEmbeddingConfigFromYaml();
+  if (embeddingYamlConfig.provider === 'openai') {
+    setEmbeddingConfig({
+      provider: 'openai',
+      openai: {
+        apiKey: embeddingYamlConfig.openai?.api_key,
+        embedModel: embeddingYamlConfig.openai?.model,
+      },
+    });
   }
 
   switch (cli.command) {
