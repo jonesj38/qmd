@@ -70,7 +70,7 @@ import {
   createStore,
   getDefaultDbPath,
 } from "./store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, getDefaultEmbeddingLLM, withLLMSession, pullModels, setEmbeddingConfig, isUsingOpenAI, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -87,6 +87,7 @@ import {
   setGlobalContext,
   listAllContexts,
   setConfigIndexName,
+  getEmbeddingConfig as getEmbeddingConfigFromYaml,
 } from "./collections.js";
 
 // Enable production mode - allows using default database path
@@ -2460,6 +2461,18 @@ if (isMain) {
   if (!cli.command || cli.values.help) {
     showHelp();
     process.exit(cli.values.help ? 0 : 1);
+  }
+
+  // Load embedding configuration from config file
+  const embeddingYamlConfig = getEmbeddingConfigFromYaml();
+  if (embeddingYamlConfig.provider === 'openai') {
+    setEmbeddingConfig({
+      provider: 'openai',
+      openai: {
+        apiKey: embeddingYamlConfig.openai?.api_key,
+        embedModel: embeddingYamlConfig.openai?.model,
+      },
+    });
   }
 
   switch (cli.command) {
