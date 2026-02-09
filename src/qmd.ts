@@ -2030,16 +2030,13 @@ function search(query: string, opts: OutputOptions): void {
   const db = getDb();
 
   // Validate collection filter (supports multiple -c flags)
-  // Use default collections if none specified
   const collectionNames = resolveCollectionFilter(opts.collection, true);
   const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
 
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
-  const results = filterByCollections(
-    searchFTS(db, query, fetchLimit, singleCollection),
-    collectionNames
-  );
+  // Pass collections directly to searchFTS (it now supports arrays)
+  const results = searchFTS(db, query, fetchLimit, collectionNames.length > 0 ? collectionNames : undefined);
 
   // Add context to results
   const resultsWithContext = results.map(r => ({
