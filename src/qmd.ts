@@ -2036,7 +2036,6 @@ function search(query: string, opts: OutputOptions): void {
   const db = getDb();
 
   // Validate collection filter (supports multiple -c flags)
-  // Use default collections if none specified
   const collectionNames = resolveCollectionFilter(opts.collection, true);
   const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
 
