@@ -3339,8 +3339,7 @@ export interface StructuredSubSearch {
 }
 
 export interface StructuredSearchOptions {
-  collection?: string;      // Single collection filter
-  collections?: string[];   // Multiple collections filter (OR)
+  collections?: string[];   // Filter to specific collections (OR match)
   limit?: number;           // default 10
   minScore?: number;        // default 0
   candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
@@ -3377,9 +3376,7 @@ export async function structuredSearch(
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
   const hooks = options?.hooks;
 
-  // Normalize collection filter to array (undefined = all collections)
-  const collections: string[] | undefined = options?.collections
-    ?? (options?.collection ? [options.collection] : undefined);
+  const collections = options?.collections;
 
   if (searches.length === 0) return [];
 
