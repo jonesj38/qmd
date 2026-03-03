@@ -2157,14 +2157,14 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
   // Check for structured query syntax (lex:/vec:/hyde: prefixes)
   const structuredQueries = parseStructuredQuery(query);
 
-  await withLLMSession(async () => {
+  const run = async () => {
     let results;
 
     if (structuredQueries) {
       // Structured search — user provided their own query expansions
       const typeLabels = structuredQueries.map(s => s.type).join('+');
       process.stderr.write(`${c.dim}Structured search: ${structuredQueries.length} queries (${typeLabels})${c.reset}\n`);
-      
+
       // Log each sub-query
       for (const s of structuredQueries) {
         let preview = s.query.replace(/\n/g, ' ');
@@ -2265,7 +2265,13 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       context: r.context,
       docid: r.docid,
     })), displayQuery, { ...opts, limit: results.length });
-  }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
+  };
+
+  if (isUsingOpenAI()) {
+    await run();
+  } else {
+    await withLLMSession(async () => run(), { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
+  }
 }
 
 // Parse CLI arguments using util.parseArgs
