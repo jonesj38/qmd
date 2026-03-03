@@ -527,6 +527,16 @@ export OPENAI_API_KEY="dummy"
 
 Then configure your embedding model in `index.yml` to match the model id exposed by your endpoint.
 
+### Runtime behavior and precedence
+
+- OpenAI mode is enabled when either:
+  - `QMD_OPENAI=1`, or
+  - `embedding.provider: openai` is set in `index.yml`.
+- `OPENAI_API_KEY` overrides `embedding.openai.api_key` when both are present.
+- `OPENAI_BASE_URL` overrides `embedding.openai.base_url` when both are present.
+- `embedding.openai.model` is read from `index.yml`.
+
+
 ## How It Works
 
 ### Indexing Flow
