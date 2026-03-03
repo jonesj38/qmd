@@ -2290,6 +2290,7 @@ if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsW
       provider: 'openai',
       openai: {
         apiKey: process.env.OPENAI_API_KEY || embeddingYamlConfig.openai?.api_key,
+        baseURL: process.env.OPENAI_BASE_URL || embeddingYamlConfig.openai?.base_url,
         embedModel: embeddingYamlConfig.openai?.model,
       },
     });
