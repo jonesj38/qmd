@@ -1440,7 +1440,7 @@ export async function disposeDefaultLlamaCpp(): Promise<void> {
 // OpenAI Embedding Support
 // =============================================================================
 
-import { OpenAIEmbedding, type OpenAIConfig } from "./openai-llm.js";
+import { OpenAILLM, type OpenAIConfig } from "./openai-llm.js";
 
 /**
  * Embedding provider configuration
@@ -1454,7 +1454,7 @@ export type EmbeddingConfig = {
 
 // Default embedding config: use local llama-cpp
 let embeddingConfig: EmbeddingConfig = { provider: 'local' };
-let openAIEmbedding: OpenAIEmbedding | null = null;
+let openAIEmbedding: OpenAILLM | null = null;
 
 /**
  * Set the embedding configuration. Call before using embeddings.
@@ -1463,13 +1463,6 @@ export function setEmbeddingConfig(config: EmbeddingConfig): void {
   embeddingConfig = config;
   // Reset OpenAI instance if config changes
   openAIEmbedding = null;
-}
-
-/**
- * Get the current embedding configuration
- */
-export function getEmbeddingConfig(): EmbeddingConfig {
-  return embeddingConfig;
 }
 
 /**
@@ -1486,7 +1479,7 @@ export function isUsingOpenAI(): boolean {
 export function getDefaultEmbeddingLLM(): LLM {
   if (embeddingConfig.provider === 'openai') {
     if (!openAIEmbedding) {
-      openAIEmbedding = new OpenAIEmbedding(embeddingConfig.openai);
+      openAIEmbedding = new OpenAILLM(embeddingConfig.openai);
     }
     return openAIEmbedding;
   }

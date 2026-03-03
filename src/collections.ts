@@ -49,7 +49,7 @@ export interface EmbeddingProviderConfig {
  */
 export interface CollectionConfig {
   global_context?: string;                    // Context applied to all collections
-  collections: Record<string, Collection>;   // Collection name -> config
+  collections: Record<string, Collection>;    // Collection name -> config
   embedding?: EmbeddingProviderConfig;        // Optional embedding provider settings
 }
 
@@ -466,7 +466,7 @@ export function isValidCollectionName(name: string): boolean {
  * Get embedding configuration from config file
  * Returns default (local) config if not specified
  */
-export function getEmbeddingConfig(): EmbeddingProviderConfig {
+export function getEmbeddingProviderConfig(): EmbeddingProviderConfig {
   const config = loadConfig();
   return config.embedding || { provider: 'local' };
 }

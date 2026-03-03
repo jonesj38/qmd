@@ -97,9 +97,9 @@ async function withRetry<T>(
 }
 
 /**
- * OpenAI LLM implementation - primarily for embeddings
+ * OpenAI LLM implementation (embeddings, query expansion, reranking)
  */
-export class OpenAIEmbedding implements LLM {
+export class OpenAILLM implements LLM {
   private client: OpenAI;
   private embedModel: string;
   private expansionModel: string;
@@ -151,7 +151,7 @@ export class OpenAIEmbedding implements LLM {
   // Stub implementations for other LLM interface methods
   async generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null> {
     // Not implemented - use local model for generation
-    console.warn('OpenAIEmbedding.generate() not implemented, use local model');
+    console.warn('OpenAILLM.generate() not implemented, use local model');
     return null;
   }
 
@@ -328,15 +328,15 @@ Example output for 5 documents: 2,0,4,1,3`
 }
 
 // Singleton instance
-let defaultOpenAI: OpenAIEmbedding | null = null;
+let defaultOpenAI: OpenAILLM | null = null;
 
-export function getDefaultOpenAI(config?: OpenAIConfig): OpenAIEmbedding {
+export function getDefaultOpenAI(config?: OpenAIConfig): OpenAILLM {
   if (!defaultOpenAI) {
-    defaultOpenAI = new OpenAIEmbedding(config);
+    defaultOpenAI = new OpenAILLM(config);
   }
   return defaultOpenAI;
 }
 
-export function setDefaultOpenAI(llm: OpenAIEmbedding | null): void {
+export function setDefaultOpenAI(llm: OpenAILLM | null): void {
   defaultOpenAI = llm;
 }

@@ -87,7 +87,7 @@ import {
   setGlobalContext,
   listAllContexts,
   setConfigIndexName,
-  getEmbeddingConfig as getEmbeddingConfigFromYaml,
+  getEmbeddingProviderConfig,
 } from "./collections.js";
 
 // Enable production mode - allows using default database path
@@ -2505,16 +2505,16 @@ if (isMain) {
   }
 
   // Load embedding configuration from config file or env var
-  const embeddingYamlConfig = getEmbeddingConfigFromYaml();
-  const useOpenAI = process.env.QMD_OPENAI === '1' || embeddingYamlConfig.provider === 'openai';
+  const embeddingProviderConfig = getEmbeddingProviderConfig();
+  const useOpenAI = process.env.QMD_OPENAI === '1' || embeddingProviderConfig.provider === 'openai';
   
   if (useOpenAI) {
     setEmbeddingConfig({
       provider: 'openai',
       openai: {
-        apiKey: process.env.OPENAI_API_KEY || embeddingYamlConfig.openai?.api_key,
-        baseURL: process.env.OPENAI_BASE_URL || embeddingYamlConfig.openai?.base_url,
-        embedModel: embeddingYamlConfig.openai?.model,
+        apiKey: process.env.OPENAI_API_KEY || embeddingProviderConfig.openai?.api_key,
+        baseURL: process.env.OPENAI_BASE_URL || embeddingProviderConfig.openai?.base_url,
+        embedModel: embeddingProviderConfig.openai?.model,
       },
     });
   }
