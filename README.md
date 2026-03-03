@@ -511,6 +511,21 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `XDG_CACHE_HOME` | `~/.cache` | Cache directory location |
+| `QMD_OPENAI` | _(unset)_ | Set to `1` to use OpenAI-compatible APIs for embeddings/query expansion/reranking instead of local llama.cpp models. |
+| `OPENAI_BASE_URL` | _(unset)_ | Base URL for your OpenAI-compatible endpoint (for example: `http://model-runner.docker.internal:80/v1`). |
+| `OPENAI_API_KEY` | _(unset)_ | API key sent to the OpenAI-compatible endpoint. Use any non-empty value if your local endpoint does not require auth. |
+
+### Remote OpenAI-Compatible Endpoint Example
+
+Use this when running inference on an external/local OpenAI-compatible server (Docker Model Runner, vLLM, etc.):
+
+```bash
+export QMD_OPENAI=1
+export OPENAI_BASE_URL="http://model-runner.docker.internal:80/v1"
+export OPENAI_API_KEY="dummy"
+```
+
+Then configure your embedding model in `index.yml` to match the model id exposed by your endpoint.
 
 ## How It Works
 
