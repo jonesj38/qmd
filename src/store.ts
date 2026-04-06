@@ -1420,12 +1420,31 @@ export async function generateEmbeddings(
   const totalDocs = docsToEmbed.length;
   const startTime = Date.now();
 
-  // Use store's LlamaCpp or global singleton, wrapped in a session
-  const llm = getLlm(store);
-  const embedModelUri = llm.embedModelName;
+  // Use OpenAI or local LlamaCpp depending on config
+  const llm = isUsingOpenAI() ? getDefaultEmbeddingLLM() : getLlm(store);
+  const embedModelUri = llm.getModelName();
 
-  // Create a session manager for this llm instance
-  const result = await withLLMSessionForLlm(llm, async (session) => {
+  // For OpenAI mode, call LLM methods directly (no session lifecycle needed).
+  // For local mode, wrap in a session to coordinate with VRAM idle timeouts.
+  const runWithLLM = async <T>(
+    fn: (api: ILLMSession) => Promise<T>,
+    sessionOptions?: { maxDuration?: number; name?: string },
+  ): Promise<T> => {
+    if (isUsingOpenAI()) {
+      const ac = new AbortController();
+      return fn({
+        embed: (text, opts) => llm.embed(text, opts),
+        embedBatch: (texts, opts) => llm.embedBatch(texts, opts),
+        expandQuery: (q, opts) => llm.expandQuery(q, opts),
+        rerank: (q, docs, opts) => llm.rerank(q, docs, opts),
+        isValid: true,
+        signal: ac.signal,
+      });
+    }
+    return withLLMSessionForLlm(llm as LlamaCpp, fn, sessionOptions);
+  };
+
+  const result = await runWithLLM(async (session) => {
     let chunksEmbedded = 0;
     let errors = 0;
     let bytesProcessed = 0;
@@ -4515,8 +4534,8 @@ export async function structuredSearch(
         s.type === 'vec' || s.type === 'hyde'
     );
     if (vecSearches.length > 0) {
-      const llm = getLlm(store);
-      const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, llm.embedModelName));
+      const llm = isUsingOpenAI() ? getDefaultEmbeddingLLM() : getLlm(store);
+      const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, llm.getModelName()));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
       const embeddings = await llm.embedBatch(textsToEmbed);
