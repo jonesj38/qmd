@@ -4,16 +4,25 @@
  * Provides embeddings, text generation, and reranking using local GGUF models.
  */
 
-import {
-  getLlama,
-  resolveModelFile,
-  LlamaChatSession,
-  LlamaLogLevel,
-  type Llama,
-  type LlamaModel,
-  type LlamaEmbeddingContext,
-  type Token as LlamaToken,
+// node-llama-cpp is loaded lazily to avoid triggering native compilation
+// when using remote OpenAI-compatible backends (QMD_OPENAI_BASE_URL).
+// Only the type imports are static (erased at compile time).
+import type {
+  Llama,
+  LlamaModel,
+  LlamaEmbeddingContext,
+  Token as LlamaToken,
 } from "node-llama-cpp";
+
+type NodeLlamaCpp = typeof import("node-llama-cpp");
+let _nlc: NodeLlamaCpp | null = null;
+
+async function loadNodeLlamaCpp(): Promise<NodeLlamaCpp> {
+  if (!_nlc) {
+    _nlc = await import("node-llama-cpp");
+  }
+  return _nlc;
+}
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync } from "fs";
@@ -292,7 +301,8 @@ export async function pullModels(
       }
     }
 
-    const path = await resolveModelFile(model, cacheDir);
+    const nlc = await loadNodeLlamaCpp();
+    const path = await nlc.resolveModelFile(model, cacheDir);
     const sizeBytes = existsSync(path) ? statSync(path).size : 0;
     if (hfRef && filename) {
       const remoteEtag = await getRemoteEtag(hfRef);
@@ -573,10 +583,11 @@ export class LlamaCpp implements LLM {
       const gpuOverride = (process.env.QMD_LLAMA_GPU ?? "").toLowerCase();
       const forceCpu = ["false", "off", "none", "disable", "disabled", "0"].includes(gpuOverride);
 
+      const nlc = await loadNodeLlamaCpp();
       const loadLlama = async (gpu: "auto" | false) =>
-        await getLlama({
+        await nlc.getLlama({
           build: "autoAttempt",
-          logLevel: LlamaLogLevel.error,
+          logLevel: nlc.LlamaLogLevel.error,
           gpu,
         });
 
@@ -612,7 +623,8 @@ export class LlamaCpp implements LLM {
   private async resolveModel(modelUri: string): Promise<string> {
     this.ensureModelCacheDir();
     // resolveModelFile handles HF URIs and downloads to the cache dir
-    return await resolveModelFile(modelUri, this.modelCacheDir);
+    const nlc = await loadNodeLlamaCpp();
+    return await nlc.resolveModelFile(modelUri, this.modelCacheDir);
   }
 
   /**
@@ -1016,9 +1028,10 @@ export class LlamaCpp implements LLM {
     await this.ensureGenerateModel();
 
     // Create fresh context -> sequence -> session for each call
+    const nlc = await loadNodeLlamaCpp();
     const context = await this.generateModel!.createContext();
     const sequence = context.getSequence();
-    const session = new LlamaChatSession({ contextSequence: sequence });
+    const session = new nlc.LlamaChatSession({ contextSequence: sequence });
 
     const maxTokens = options.maxTokens ?? 150;
     // Qwen3 recommends temp=0.7, topP=0.8, topK=20 for non-thinking mode
@@ -1093,11 +1106,12 @@ export class LlamaCpp implements LLM {
       : `/no_think Expand this search query: ${query}`;
 
     // Create a bounded context for expansion to prevent large default VRAM allocations.
+    const nlc = await loadNodeLlamaCpp();
     const genContext = await this.generateModel!.createContext({
       contextSize: this.expandContextSize,
     });
     const sequence = genContext.getSequence();
-    const session = new LlamaChatSession({ contextSequence: sequence });
+    const session = new nlc.LlamaChatSession({ contextSequence: sequence });
 
     try {
       // Qwen3 recommended settings for non-thinking mode:

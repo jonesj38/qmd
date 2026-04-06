@@ -11,12 +11,9 @@
  *   bun src/bench-rerank.ts --docs 100   # custom doc count
  */
 
-import {
-  getLlama,
-  resolveModelFile,
-  LlamaLogLevel,
-  type Llama,
-  type LlamaModel,
+import type {
+  Llama,
+  LlamaModel,
 } from "node-llama-cpp";
 import { homedir } from "os";
 import { join } from "path";
@@ -191,10 +188,11 @@ async function main() {
   console.log("  QMD Reranker Benchmark");
   console.log("═══════════════════════════════════════════════════════════════\n");
 
-  const llama = await getLlama({
+  const nlc = await import("node-llama-cpp");
+  const llama = await nlc.getLlama({
     // attempt to build
     build: "autoAttempt",
-    logLevel: LlamaLogLevel.error
+    logLevel: nlc.LlamaLogLevel.error
   });
   let gpuLabel: string = llama.gpu === false
     ? "cpu"
@@ -226,7 +224,7 @@ async function main() {
   // Load model
   console.log(`\nModel`);
   console.log(`  URI:       ${RERANK_MODEL}`);
-  const modelPath = await resolveModelFile(RERANK_MODEL, MODEL_CACHE);
+  const modelPath = await nlc.resolveModelFile(RERANK_MODEL, MODEL_CACHE);
   const vramPreModel = llama.gpu ? await llama.getVramState() : null;
   const model = await llama.loadModel({ modelPath });
   const vramPostModel = llama.gpu ? await llama.getVramState() : null;

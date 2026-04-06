@@ -2845,14 +2845,20 @@ if (isMain) {
     process.exit(cli.values.help ? 0 : 1);
   }
 
-  // Load embedding configuration from config file
+  // Load embedding configuration.
+  // Priority: YAML config > env vars > default (local).
+  // Setting QMD_OPENAI_BASE_URL alone is enough to activate OpenAI mode.
   const embeddingYamlConfig = getEmbeddingConfigFromYaml();
-  if (embeddingYamlConfig.provider === 'openai') {
+  const useOpenAI = embeddingYamlConfig.provider === 'openai'
+    || !!process.env.QMD_OPENAI_BASE_URL
+    || process.env.QMD_OPENAI === '1';
+
+  if (useOpenAI) {
     setEmbeddingConfig({
       provider: 'openai',
       openai: {
         apiKey: embeddingYamlConfig.openai?.api_key || process.env.QMD_OPENAI_API_KEY,
-        baseUrl: embeddingYamlConfig.openai?.base_url || process.env.QMD_OPENAI_BASE_URL,
+        baseURL: embeddingYamlConfig.openai?.base_url || process.env.QMD_OPENAI_BASE_URL,
         embedModel: embeddingYamlConfig.openai?.model || process.env.QMD_OPENAI_EMBED_MODEL,
       },
     });
