@@ -48,7 +48,8 @@ export interface ModelsConfig {
 export interface EmbeddingProviderConfig {
   provider?: 'local' | 'openai';  // Default: 'local'
   openai?: {
-    api_key?: string;             // Falls back to OPENAI_API_KEY env var
+    api_key?: string;             // Falls back to QMD_OPENAI_API_KEY env var
+    base_url?: string;            // Falls back to QMD_OPENAI_BASE_URL env var
     model?: string;               // Default: 'text-embedding-3-small'
   };
 }

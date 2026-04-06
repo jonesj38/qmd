@@ -2838,8 +2838,9 @@ if (isMain) {
     setEmbeddingConfig({
       provider: 'openai',
       openai: {
-        apiKey: embeddingYamlConfig.openai?.api_key,
-        embedModel: embeddingYamlConfig.openai?.model,
+        apiKey: embeddingYamlConfig.openai?.api_key || process.env.QMD_OPENAI_API_KEY,
+        baseUrl: embeddingYamlConfig.openai?.base_url || process.env.QMD_OPENAI_BASE_URL,
+        embedModel: embeddingYamlConfig.openai?.model || process.env.QMD_OPENAI_EMBED_MODEL,
       },
     });
   }
