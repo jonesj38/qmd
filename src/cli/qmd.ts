@@ -505,6 +505,11 @@ async function showStatus(): Promise<void> {
     // Don't fail status if LLM init fails
   }
 
+  if (isUsingOpenAI()) {
+    console.log(`${c.bold}Provider${c.reset}`);
+    console.log(`  Embeddings/Rerank/Expansion: OpenAI-compatible endpoint`);
+  }
+
   // Tips section
   const tips: string[] = [];
 
@@ -2271,7 +2276,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
 
   checkIndexHealth(store.db);
 
-  await withLLMSession(async () => {
+  const llmSession = async () => {
     let results = await vectorSearchQuery(store, query, {
       collection: singleCollection,
       limit: opts.all ? 500 : (opts.limit || 10),
@@ -2309,7 +2314,15 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
       context: r.context,
       docid: r.docid,
     })), query, { ...opts, limit: results.length });
-  }, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
+  };
+
+  if (isUsingOpenAI()) {
+    await llmSession();
+  } else {
+    await withLLMSession(async () => llmSession(),
+      { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' }
+    );
+  }
 }
 
 async function querySearch(query: string, opts: OutputOptions, _embedModel: string = DEFAULT_EMBED_MODEL, _rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
