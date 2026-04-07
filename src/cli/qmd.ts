@@ -81,6 +81,7 @@ import {
   disposeDefaultLlamaCpp,
   getDefaultLlamaCpp,
   getDefaultEmbeddingLLM,
+  getEmbeddingConfig,
   isUsingOpenAI,
   setDefaultLlamaCpp,
   setEmbeddingConfig,
@@ -462,8 +463,14 @@ async function showStatus(): Promise<void> {
     console.log(`\n${c.dim}No collections. Run 'qmd collection add .' to index markdown files.${c.reset}`);
   }
 
-  // Models
-  {
+  // Models / Provider info
+  if (isUsingOpenAI()) {
+    const embCfg = getEmbeddingConfig();
+    console.log(`\n${c.bold}Provider${c.reset}`);
+    console.log(`  Mode:        ${c.green}OpenAI-compatible${c.reset}`);
+    console.log(`  Base URL:    ${embCfg.openai?.baseURL || process.env.QMD_OPENAI_BASE_URL || '(default)'}`);
+    console.log(`  Embed model: ${embCfg.openai?.embedModel || 'text-embedding-3-small'}`);
+  } else {
     // hf:org/repo/file.gguf → https://huggingface.co/org/repo
     const hfLink = (uri: string) => {
       const match = uri.match(/^hf:([^/]+\/[^/]+)\//);
@@ -473,41 +480,35 @@ async function showStatus(): Promise<void> {
     console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
     console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)}`);
     console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
-  }
 
-  // Device / GPU info
-  try {
-    const llm = getDefaultLlamaCpp();
-    const device = await llm.getDeviceInfo();
-    console.log(`\n${c.bold}Device${c.reset}`);
-    if (device.gpu) {
-      console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
-      if (device.gpuDevices.length > 0) {
-        // Deduplicate and count GPUs
-        const counts = new Map<string, number>();
-        for (const name of device.gpuDevices) {
-          counts.set(name, (counts.get(name) || 0) + 1);
+    // Device / GPU info (local mode only — skip in OpenAI mode to avoid triggering compilation)
+    try {
+      const llm = getDefaultLlamaCpp();
+      const device = await llm.getDeviceInfo();
+      console.log(`\n${c.bold}Device${c.reset}`);
+      if (device.gpu) {
+        console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
+        if (device.gpuDevices.length > 0) {
+          const counts = new Map<string, number>();
+          for (const name of device.gpuDevices) {
+            counts.set(name, (counts.get(name) || 0) + 1);
+          }
+          const deviceStr = Array.from(counts.entries())
+            .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
+            .join(', ');
+          console.log(`  Devices:  ${deviceStr}`);
         }
-        const deviceStr = Array.from(counts.entries())
-          .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
-          .join(', ');
-        console.log(`  Devices:  ${deviceStr}`);
+        if (device.vram) {
+          console.log(`  VRAM:     ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
+        }
+      } else {
+        console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
+        console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
       }
-      if (device.vram) {
-        console.log(`  VRAM:     ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
-      }
-    } else {
-      console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
-      console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
+      console.log(`  CPU:      ${device.cpuCores} math cores`);
+    } catch {
+      // Don't fail status if LLM init fails
     }
-    console.log(`  CPU:      ${device.cpuCores} math cores`);
-  } catch {
-    // Don't fail status if LLM init fails
-  }
-
-  if (isUsingOpenAI()) {
-    console.log(`${c.bold}Provider${c.reset}`);
-    console.log(`  Embeddings/Rerank/Expansion: OpenAI-compatible endpoint`);
   }
 
   // Tips section
