@@ -1710,34 +1710,37 @@ async function vectorIndex(
 
   const startTime = Date.now();
 
-  const result = await generateEmbeddings(storeInstance, {
-    force,
-    model,
-    maxDocsPerBatch: batchOptions?.maxDocsPerBatch,
-    maxBatchBytes: batchOptions?.maxBatchBytes,
-    chunkStrategy: batchOptions?.chunkStrategy,
-    onProgress: (info) => {
-      if (info.totalBytes === 0) return;
-      const percent = (info.bytesProcessed / info.totalBytes) * 100;
-      progress.set(percent);
+  let result: Awaited<ReturnType<typeof generateEmbeddings>>;
+  try {
+    result = await generateEmbeddings(storeInstance, {
+      force,
+      model,
+      maxDocsPerBatch: batchOptions?.maxDocsPerBatch,
+      maxBatchBytes: batchOptions?.maxBatchBytes,
+      chunkStrategy: batchOptions?.chunkStrategy,
+      onProgress: (info) => {
+        if (info.totalBytes === 0) return;
+        const percent = (info.bytesProcessed / info.totalBytes) * 100;
+        progress.set(percent);
 
-      const elapsed = (Date.now() - startTime) / 1000;
-      const bytesPerSec = info.bytesProcessed / elapsed;
-      const remainingBytes = info.totalBytes - info.bytesProcessed;
-      const etaSec = remainingBytes / bytesPerSec;
+        const elapsed = (Date.now() - startTime) / 1000;
+        const bytesPerSec = info.bytesProcessed / elapsed;
+        const remainingBytes = info.totalBytes - info.bytesProcessed;
+        const etaSec = remainingBytes / bytesPerSec;
 
-      const bar = renderProgressBar(percent);
-      const percentStr = percent.toFixed(0).padStart(3);
-      const throughput = `${formatBytes(bytesPerSec)}/s`;
-      const eta = elapsed > 2 ? formatETA(etaSec) : "...";
-      const errStr = info.errors > 0 ? ` ${c.yellow}${info.errors} err${c.reset}` : "";
+        const bar = renderProgressBar(percent);
+        const percentStr = percent.toFixed(0).padStart(3);
+        const throughput = `${formatBytes(bytesPerSec)}/s`;
+        const eta = elapsed > 2 ? formatETA(etaSec) : "...";
+        const errStr = info.errors > 0 ? ` ${c.yellow}${info.errors} err${c.reset}` : "";
 
-      if (isTTY) process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${info.chunksEmbedded}/${info.totalChunks}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}   `);
-    },
-  });
-
-  progress.clear();
-  cursor.show();
+        if (isTTY) process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${info.chunksEmbedded}/${info.totalChunks}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}   `);
+      },
+    });
+  } finally {
+    progress.clear();
+    cursor.show();
+  }
 
   const totalTimeSec = result.durationMs / 1000;
 
@@ -2007,7 +2010,7 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
         const clickable = termLink(`${displayPath}${lineInfo}`, linkTarget);
         console.log(`${c.cyan}${clickable}${c.reset}${docidStr}`);
       } else {
-        console.log(`${c.cyan}${legacyPath}${c.dim}${lineInfo}${c.reset}${docidStr}`);
+        console.log(`${c.cyan}${legacyPath}${c.reset}${c.dim}${lineInfo}${c.reset}${docidStr}`);
       }
 
       // Line 2: Title (if available)
