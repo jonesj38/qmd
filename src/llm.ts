@@ -1083,6 +1083,12 @@ export class LlamaCpp implements LLM {
    */
   private embedContextsCreatePromise: Promise<LlamaEmbeddingContext[]> | null = null;
 
+  // Promise guard for rerank context creation — mirrors embedContextsCreatePromise.
+  // Without this, two concurrent first-callers both see rerankContexts.length === 0,
+  // both start building contexts, and the disposal of one caller's half-built
+  // context causes "Object is disposed" in the other caller.
+  private rerankContextsCreatePromise: Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> | null = null;
+
   private async ensureEmbedContexts(): Promise<LlamaEmbeddingContext[]> {
     if (this.embedContexts.length > 0) {
       this.touchActivity();
@@ -1212,7 +1218,20 @@ export class LlamaCpp implements LLM {
     return Number.isFinite(v) && v > 0 ? v : 2048;
   })();
   private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
-    if (this.rerankContexts.length === 0) {
+    if (this.rerankContexts.length > 0) {
+      this.touchActivity();
+      return this.rerankContexts;
+    }
+
+    // Guard against concurrent first-callers — same pattern as ensureEmbedContexts.
+    // Without this, two parallel callers both see length === 0, both create contexts,
+    // and the first one to complete disposes the other's half-built context, producing
+    // "Object is disposed" on the cold-start query (issue #682).
+    if (this.rerankContextsCreatePromise) {
+      return await this.rerankContextsCreatePromise;
+    }
+
+    this.rerankContextsCreatePromise = (async () => {
       const model = await this.ensureRerankModel();
       // ~960 MB per context with flash attention at contextSize 2048
       const n = Math.min(await this.computeParallelism(1000), 4);
@@ -1238,9 +1257,16 @@ export class LlamaCpp implements LLM {
           break;
         }
       }
+      this.touchActivity();
+      return this.rerankContexts;
+    })();
+
+    try {
+      return await this.rerankContextsCreatePromise;
+    } finally {
+      // Keep the resolved contexts cached; clear only the in-flight promise.
+      this.rerankContextsCreatePromise = null;
     }
-    this.touchActivity();
-    return this.rerankContexts;
   }
 
   // ==========================================================================
@@ -1747,6 +1773,7 @@ export class LlamaCpp implements LLM {
     this.generateModelLoadPromise = null;
     this.rerankModelLoadPromise = null;
     this.llamaLoadPromise = null;
+    this.rerankContextsCreatePromise = null;
   }
 }
 
