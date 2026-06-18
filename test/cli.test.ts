@@ -948,6 +948,25 @@ describe("CLI Update Command", () => {
     expect(stdout).toContain("Updating");
   });
 
+  test("updates only requested collection with -c", async () => {
+    const { dbPath, configDir } = await createIsolatedTestEnv("update-filter");
+    const firstDir = join(testDir, `update-filter-first-${Date.now()}`);
+    const secondDir = join(testDir, `update-filter-second-${Date.now()}`);
+    await mkdir(firstDir, { recursive: true });
+    await mkdir(secondDir, { recursive: true });
+    await writeFile(join(firstDir, "first.md"), "# First\n");
+    await writeFile(join(secondDir, "second.md"), "# Second\n");
+
+    expect((await runQmd(["collection", "add", firstDir, "--name", "first"], { dbPath, configDir })).exitCode).toBe(0);
+    expect((await runQmd(["collection", "add", secondDir, "--name", "second"], { dbPath, configDir })).exitCode).toBe(0);
+
+    const { stdout, exitCode } = await runQmd(["update", "-c", "second"], { dbPath, configDir });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Updating 1 collection(s)");
+    expect(stdout).toContain("second");
+    expect(stdout).not.toContain("first (**/*.md)");
+  });
+
   test("deactivates stale docs when collection has zero matching files", async () => {
     const { dbPath, configDir } = await createIsolatedTestEnv("update-empty");
     const collectionDir = join(testDir, `update-empty-${Date.now()}`);
