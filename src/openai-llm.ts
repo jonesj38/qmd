@@ -85,6 +85,22 @@ function sanitizedOpenAIFetch(input: unknown, init?: unknown): Promise<Response>
   return fetch(input as Parameters<typeof fetch>[0], nextInit);
 }
 
+function isLoopbackBaseURL(baseURL?: string): boolean {
+  if (!baseURL) return false;
+  try {
+    const hostname = new URL(baseURL).hostname.toLowerCase();
+    return (
+      hostname === 'localhost' ||
+      hostname === '127.0.0.1' ||
+      hostname === '::1' ||
+      hostname === '[::1]' ||
+      hostname.startsWith('127.')
+    );
+  } catch {
+    return false;
+  }
+}
+
 function createOpenAIClient(opts: { apiKey?: string; baseURL?: string }): OpenAI {
   const clientOptions: Record<string, unknown> = {
     apiKey: opts.apiKey,
@@ -92,6 +108,11 @@ function createOpenAIClient(opts: { apiKey?: string; baseURL?: string }): OpenAI
   };
   if (opts.baseURL) {
     clientOptions.baseURL = opts.baseURL;
+  }
+  if (isLoopbackBaseURL(opts.baseURL)) {
+    clientOptions.defaultHeaders = {
+      'X-EdwinPAI-Local-Shad': 'allow-openai-compatible',
+    };
   }
   return new OpenAI(clientOptions as ConstructorParameters<typeof OpenAI>[0]);
 }
