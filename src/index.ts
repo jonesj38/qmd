@@ -23,7 +23,6 @@ import {
   structuredSearch,
   extractSnippet,
   addLineNumbers,
-  DEFAULT_EMBED_MODEL,
   DEFAULT_MULTI_GET_MAX_BYTES,
   reindexCollection,
   generateEmbeddings,
@@ -66,6 +65,7 @@ import {
 } from "./store.js";
 import {
   LlamaCpp,
+  setEmbeddingConfig,
 } from "./llm.js";
 import {
   setConfigSource,
@@ -159,6 +159,8 @@ export interface SearchOptions {
   collections?: string[];
   /** Max results (default: 10) */
   limit?: number;
+  /** Max candidates to rerank (default: 40) */
+  candidateLimit?: number;
   /** Minimum score threshold */
   minScore?: number;
   /** Include explain traces */
@@ -290,6 +292,8 @@ export interface QMDStore {
   embed(options?: {
     force?: boolean;
     model?: string;
+    /** Restrict embedding to documents in one collection. */
+    collection?: string;
     maxDocsPerBatch?: number;
     maxBatchBytes?: number;
     chunkStrategy?: ChunkStrategy;
@@ -335,6 +339,33 @@ export interface QMDStore {
  * await store.close()
  * ```
  */
+function configureEmbeddingProvider(config?: CollectionConfig): void {
+  const embeddingYamlConfig = config?.embedding || { provider: 'local' as const };
+  const useOpenAI = embeddingYamlConfig.provider === 'openai'
+    || !!process.env.QMD_OPENAI_BASE_URL
+    || process.env.QMD_OPENAI === '1';
+
+  if (useOpenAI) {
+    setEmbeddingConfig({
+      provider: 'openai',
+      openai: {
+        apiKey: embeddingYamlConfig.openai?.api_key || process.env.QMD_OPENAI_API_KEY,
+        embedModel: embeddingYamlConfig.openai?.model || process.env.QMD_OPENAI_EMBED_MODEL,
+        expansionModel: embeddingYamlConfig.openai?.expansion_model,
+        rerankModel: embeddingYamlConfig.openai?.rerank_model,
+        baseURL: embeddingYamlConfig.openai?.base_url || process.env.QMD_OPENAI_BASE_URL,
+        chatBaseURL: embeddingYamlConfig.openai?.chat_base_url,
+        chatApiKey: embeddingYamlConfig.openai?.chat_api_key,
+        rerankBaseURL: embeddingYamlConfig.openai?.rerank_base_url,
+        rerankApiKey: embeddingYamlConfig.openai?.rerank_api_key,
+      },
+    });
+    return;
+  }
+
+  setEmbeddingConfig({ provider: 'local' });
+}
+
 export async function createStore(options: StoreOptions): Promise<QMDStore> {
   if (!options.dbPath) {
     throw new Error("dbPath is required");
@@ -364,6 +395,8 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     syncConfigToDb(db, config);
   }
   // else: DB-only mode — no external config, use existing store_collections
+
+  configureEmbeddingProvider(config);
 
   // Create a per-store LlamaCpp instance — lazy-loads models on first use,
   // auto-unloads after 5 min inactivity to free VRAM.
@@ -400,6 +433,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
           minScore: opts.minScore,
           explain: opts.explain,
           intent: opts.intent,
+          candidateLimit: opts.candidateLimit,
           skipRerank,
           chunkStrategy: opts.chunkStrategy,
         });
@@ -412,12 +446,13 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         minScore: opts.minScore,
         explain: opts.explain,
         intent: opts.intent,
+        candidateLimit: opts.candidateLimit,
         skipRerank,
         chunkStrategy: opts.chunkStrategy,
       });
     },
     searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection),
-    searchVector: async (q, opts) => internal.searchVec(q, DEFAULT_EMBED_MODEL, opts?.limit, opts?.collection),
+    searchVector: async (q, opts) => internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection),
     expandQuery: async (q, opts) => internal.expandQuery(q, undefined, opts?.intent),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
     getDocumentBody: async (pathOrDocid, opts) => {
@@ -516,6 +551,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       return generateEmbeddings(internal, {
         force: embedOpts?.force,
         model: embedOpts?.model,
+        collection: embedOpts?.collection,
         maxDocsPerBatch: embedOpts?.maxDocsPerBatch,
         maxBatchBytes: embedOpts?.maxBatchBytes,
         chunkStrategy: embedOpts?.chunkStrategy,

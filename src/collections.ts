@@ -6,8 +6,8 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
-import { join, dirname } from "path";
-import { homedir } from "os";
+import { join, dirname, resolve } from "path";
+import { qmdHomedir } from "./paths.js";
 import YAML from "yaml";
 
 // ============================================================================
@@ -43,6 +43,24 @@ export interface ModelsConfig {
 }
 
 /**
+ * Embedding provider configuration (optional in config file)
+ */
+export interface EmbeddingProviderConfig {
+  provider?: 'local' | 'openai';  // Default: 'openai' when QMD_OPENAI or an OpenAI key is present, otherwise 'local'
+  openai?: {
+    api_key?: string;             // Falls back to QMD_OPENAI_API_KEY / OPENAI_API_KEY env var
+    model?: string;               // Default: 'text-embedding-3-small'
+    expansion_model?: string;     // Default: 'gpt-4o-mini'
+    rerank_model?: string;        // Default: falls back to expansion_model
+    base_url?: string;            // Base URL for embeddings (OpenAI-compatible)
+    chat_base_url?: string;       // Separate base URL for expansion (falls back to base_url)
+    chat_api_key?: string;        // Separate API key for chat endpoint (falls back to api_key)
+    rerank_base_url?: string;     // Separate base URL for reranking (falls back to chat_base_url)
+    rerank_api_key?: string;      // Separate API key for rerank endpoint (falls back to chat_api_key)
+  };
+}
+
+/**
  * The complete configuration file structure
  */
 export interface CollectionConfig {
@@ -51,6 +69,7 @@ export interface CollectionConfig {
   editor_uri_template?: string;               // Alias for editor_uri
   collections: Record<string, Collection>;    // Collection name -> config
   models?: ModelsConfig;
+  embedding?: EmbeddingProviderConfig;        // Optional embedding provider settings
 }
 
 /**
@@ -101,9 +120,7 @@ export function setConfigSource(source?: { configPath?: string; config?: Collect
 export function setConfigIndexName(name: string): void {
   // Resolve relative paths to absolute paths and sanitize for use as filename
   if (name.includes('/')) {
-    const { resolve } = require('path');
-    const { cwd } = require('process');
-    const absolutePath = resolve(cwd(), name);
+    const absolutePath = resolve(process.cwd(), name);
     // Replace path separators with underscores to create a valid filename
     currentIndexName = absolutePath.replace(/\//g, '_').replace(/^_/, '');
   } else {
@@ -120,11 +137,39 @@ function getConfigDir(): string {
   if (process.env.XDG_CONFIG_HOME) {
     return join(process.env.XDG_CONFIG_HOME, "qmd");
   }
-  return join(homedir(), ".config", "qmd");
+  return join(qmdHomedir(), ".config", "qmd");
 }
 
 function getConfigFilePath(): string {
   return join(getConfigDir(), `${currentIndexName}.yml`);
+}
+
+/**
+ * Find a project-local QMD config by walking upward from startDir.
+ * The local config lives at .qmd/index.yaml or .qmd/index.yml and,
+ * when used by the CLI, keeps both config and index DB writes inside
+ * the project instead of the global ~/.config / ~/.cache locations.
+ */
+export function findLocalConfigPath(startDir: string = process.cwd()): string | undefined {
+  let dir = resolve(startDir);
+
+  while (true) {
+    const qmdDir = join(dir, ".qmd");
+    const yamlPath = join(qmdDir, "index.yaml");
+    if (existsSync(yamlPath)) return yamlPath;
+
+    const ymlPath = join(qmdDir, "index.yml");
+    if (existsSync(ymlPath)) return ymlPath;
+
+    const parent = dirname(dir);
+    if (parent === dir) return undefined;
+    dir = parent;
+  }
+}
+
+/** Return the local SQLite index path paired with a local .qmd/index.yaml file. */
+export function getLocalDbPath(configPath: string): string {
+  return join(dirname(configPath), "index.sqlite");
 }
 
 /**
@@ -161,7 +206,8 @@ export function loadConfig(): CollectionConfig {
 
   try {
     const content = readFileSync(configPath, "utf-8");
-    const config = YAML.parse(content) as CollectionConfig;
+    const parsed = YAML.parse(content) as CollectionConfig | null | undefined;
+    const config = parsed ?? { collections: {} };
 
     // Ensure collections object exists
     if (!config.collections) {
@@ -509,4 +555,26 @@ export function configExists(): boolean {
 export function isValidCollectionName(name: string): boolean {
   // Allow alphanumeric, hyphens, underscores
   return /^[a-zA-Z0-9_-]+$/.test(name);
+}
+
+/**
+ * Get embedding configuration from config file.
+ *
+ * QMD historically defaulted to the local node-llama-cpp embedding model when the
+ * config omitted `embedding`. That is a bad default for EdwinPAI installs: the
+ * first embed pass can download/load a local GGUF model and make setup feel
+ * frozen. Prefer OpenAI whenever the installer/runtime has explicitly enabled it
+ * (`QMD_OPENAI=1`) or an OpenAI-compatible key is available, while preserving the
+ * local fallback for standalone/offline installs.
+ */
+export function getEmbeddingConfig(): EmbeddingProviderConfig {
+  const config = loadConfig();
+  if (config.embedding) return config.embedding;
+
+  const wantsOpenAI =
+    process.env.QMD_OPENAI === "1" ||
+    Boolean(process.env.QMD_OPENAI_API_KEY?.trim()) ||
+    Boolean(process.env.OPENAI_API_KEY?.trim());
+
+  return wantsOpenAI ? { provider: 'openai' } : { provider: 'local' };
 }

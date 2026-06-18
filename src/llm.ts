@@ -4,16 +4,73 @@
  * Provides embeddings, text generation, and reranking using local GGUF models.
  */
 
-import {
-  getLlama,
-  resolveModelFile,
-  LlamaChatSession,
-  LlamaLogLevel,
-  type Llama,
-  type LlamaModel,
-  type LlamaEmbeddingContext,
-  type Token as LlamaToken,
+import type {
+  Llama,
+  LlamaModel,
+  LlamaEmbeddingContext,
+  Token as LlamaToken,
 } from "node-llama-cpp";
+
+type StdoutChunk = string | Uint8Array;
+type WriteCallback = (err?: Error | null) => void;
+
+type NodeLlamaCppModule = {
+  getLlama: (options: Record<string, unknown>) => Promise<Llama>;
+  getLlamaGpuTypes?: (include?: "supported" | "allValid") => Promise<LlamaGpuMode[]>;
+  resolveModelFile: (model: string, cacheDir: string) => Promise<string>;
+  LlamaChatSession: new (options: { contextSequence: unknown }) => {
+    prompt: (prompt: string, options?: Record<string, unknown>) => Promise<string>;
+  };
+  LlamaLogLevel: { error: unknown };
+};
+
+let nodeLlamaCppImport: Promise<NodeLlamaCppModule> | null = null;
+async function loadNodeLlamaCpp(): Promise<NodeLlamaCppModule> {
+  nodeLlamaCppImport ??= withNativeStdoutRedirectedToStderr(
+    () => import("node-llama-cpp") as Promise<NodeLlamaCppModule>
+  );
+  return nodeLlamaCppImport;
+}
+
+export function setNodeLlamaCppModuleForTest(module: NodeLlamaCppModule | null): void {
+  nodeLlamaCppImport = module ? Promise.resolve(module) : null;
+  failedGpuInitModes.clear();
+  noGpuAccelerationWarningShown = false;
+  cpuForcedPrebuiltFallbackWarningShown = false;
+}
+
+type StdoutWrite = typeof process.stdout.write;
+let nativeStdoutRedirectDepth = 0;
+let originalStdoutWrite: StdoutWrite | null = null;
+
+/**
+ * Some node-llama-cpp native build/probe paths write library noise to stdout.
+ * JSON APIs must reserve stdout for machine-readable payloads, so route that
+ * noise to stderr while native llama initialization is in progress.
+ */
+export async function withNativeStdoutRedirectedToStderr<T>(fn: () => Promise<T>): Promise<T> {
+  if (nativeStdoutRedirectDepth === 0) {
+    originalStdoutWrite = process.stdout.write.bind(process.stdout) as StdoutWrite;
+    process.stdout.write = ((chunk: StdoutChunk, encodingOrCallback?: BufferEncoding | WriteCallback, callback?: WriteCallback) => {
+      if (typeof encodingOrCallback === "function") {
+        return process.stderr.write(chunk, encodingOrCallback);
+      }
+      return process.stderr.write(chunk, encodingOrCallback, callback);
+    }) as StdoutWrite;
+  }
+  nativeStdoutRedirectDepth++;
+  try {
+    return await fn();
+  } finally {
+    nativeStdoutRedirectDepth--;
+    if (nativeStdoutRedirectDepth === 0 && originalStdoutWrite) {
+      process.stdout.write = originalStdoutWrite;
+      originalStdoutWrite = null;
+    }
+  }
+}
+
+
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
@@ -36,7 +93,7 @@ export function isQwen3EmbeddingModel(modelUri: string): boolean {
  * Uses Qwen3-Embedding instruct format when a Qwen embedding model is active.
  */
 export function formatQueryForEmbedding(query: string, modelUri?: string): string {
-  const uri = modelUri ?? process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
+  const uri = modelUri ?? resolveEmbedModel();
   if (isQwen3EmbeddingModel(uri)) {
     return `Instruct: Retrieve relevant documents for the given query\nQuery: ${query}`;
   }
@@ -49,7 +106,7 @@ export function formatQueryForEmbedding(query: string, modelUri?: string): strin
  * Qwen3-Embedding encodes documents as raw text without special prefixes.
  */
 export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
-  const uri = modelUri ?? process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
+  const uri = modelUri ?? resolveEmbedModel();
   if (isQwen3EmbeddingModel(uri)) {
     // Qwen3-Embedding: documents are raw text, no task prefix
     return title ? `${title}\n${text}` : text;
@@ -208,6 +265,32 @@ export const DEFAULT_EMBED_MODEL_URI = DEFAULT_EMBED_MODEL;
 export const DEFAULT_RERANK_MODEL_URI = DEFAULT_RERANK_MODEL;
 export const DEFAULT_GENERATE_MODEL_URI = DEFAULT_GENERATE_MODEL;
 
+export type ModelResolutionConfig = {
+  embed?: string;
+  generate?: string;
+  rerank?: string;
+};
+
+export function resolveEmbedModel(config?: ModelResolutionConfig): string {
+  return config?.embed || process.env.QMD_EMBED_MODEL || DEFAULT_EMBED_MODEL;
+}
+
+export function resolveGenerateModel(config?: ModelResolutionConfig): string {
+  return config?.generate || process.env.QMD_GENERATE_MODEL || DEFAULT_GENERATE_MODEL;
+}
+
+export function resolveRerankModel(config?: ModelResolutionConfig): string {
+  return config?.rerank || process.env.QMD_RERANK_MODEL || DEFAULT_RERANK_MODEL;
+}
+
+export function resolveModels(config?: ModelResolutionConfig): Required<ModelResolutionConfig> {
+  return {
+    embed: resolveEmbedModel(config),
+    generate: resolveGenerateModel(config),
+    rerank: resolveRerankModel(config),
+  };
+}
+
 // Local model cache directory
 const MODEL_CACHE_DIR = process.env.XDG_CACHE_HOME
   ? join(process.env.XDG_CACHE_HOME, "qmd", "models")
@@ -250,37 +333,106 @@ async function getRemoteEtag(ref: HfRef): Promise<string | null> {
 
 const GGUF_MAGIC = Buffer.from("GGUF");
 
+export type GgufFileInspection = {
+  exists: boolean;
+  valid: boolean;
+  kind: "missing" | "gguf" | "html" | "invalid";
+  sizeBytes?: number;
+  magic?: string;
+  details: string;
+};
+
+function formatModelFileSize(sizeBytes: number): string {
+  return `${(sizeBytes / 1024).toFixed(0)} KB`;
+}
+
+function printableMagic(header: Buffer): string {
+  const text = header.toString("utf-8");
+  return /^[\x20-\x7e]{1,4}$/.test(text) ? text : `0x${header.toString("hex")}`;
+}
+
+/**
+ * Inspect a potential GGUF model file without mutating it.
+ * Used by doctor for early diagnostics and by runtime validation before load.
+ */
+export function inspectGgufFile(filePath: string): GgufFileInspection {
+  if (!existsSync(filePath)) {
+    return { exists: false, valid: false, kind: "missing", details: "file does not exist" };
+  }
+
+  let sizeBytes = 0;
+  try {
+    sizeBytes = statSync(filePath).size;
+    const fd = openSync(filePath, "r");
+    const sniff = Buffer.alloc(512);
+    try {
+      readSync(fd, sniff, 0, 512, 0);
+    } finally {
+      closeSync(fd);
+    }
+
+    const header = sniff.subarray(0, 4);
+    if (header.equals(GGUF_MAGIC)) {
+      return {
+        exists: true,
+        valid: true,
+        kind: "gguf",
+        sizeBytes,
+        magic: "GGUF",
+        details: `valid GGUF (${formatModelFileSize(sizeBytes)})`,
+      };
+    }
+
+    const magic = printableMagic(header);
+    const text = sniff.toString("utf-8").toLowerCase();
+    const isHtml = text.includes("<!doctype") || text.includes("<html");
+    if (isHtml) {
+      return {
+        exists: true,
+        valid: false,
+        kind: "html",
+        sizeBytes,
+        magic,
+        details: `HTML page, not a GGUF model (${formatModelFileSize(sizeBytes)}); likely proxy/firewall/captive portal response`,
+      };
+    }
+
+    return {
+      exists: true,
+      valid: false,
+      kind: "invalid",
+      sizeBytes,
+      magic,
+      details: `not valid GGUF (expected magic "GGUF", got "${magic}", ${formatModelFileSize(sizeBytes)})`,
+    };
+  } catch (error) {
+    return {
+      exists: true,
+      valid: false,
+      kind: "invalid",
+      sizeBytes,
+      details: `cannot read model file: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
 /**
  * Validate that a file is actually a GGUF model, not an HTML error page
  * from a proxy, firewall, or failed download.
  * Throws a descriptive error if the file is not valid GGUF.
  */
 function validateGgufFile(filePath: string, modelUri: string): void {
-  if (!existsSync(filePath)) return; // let downstream handle missing files
-
-  // Read header + sniff bytes in one go, then close immediately
-  const fd = openSync(filePath, "r");
-  const sniff = Buffer.alloc(512);
-  try {
-    readSync(fd, sniff, 0, 512, 0);
-  } finally {
-    closeSync(fd);
-  }
-
-  const header = sniff.subarray(0, 4);
-  if (header.equals(GGUF_MAGIC)) return; // valid GGUF
-
-  const text = sniff.toString("utf-8").toLowerCase();
-  const isHtml = text.includes("<!doctype") || text.includes("<html");
-  const got = header.toString("utf-8");
-  const sizeKB = (statSync(filePath).size / 1024).toFixed(0);
+  const inspection = inspectGgufFile(filePath);
+  if (!inspection.exists || inspection.valid) return; // let downstream handle missing files
 
   // Remove the bad file so the next attempt re-downloads
-  unlinkSync(filePath);
+  try {
+    unlinkSync(filePath);
+  } catch { /* best effort */ }
 
-  if (isHtml) {
+  if (inspection.kind === "html") {
     throw new Error(
-      `Downloaded model file is an HTML page, not a GGUF model (${sizeKB} KB).\n` +
+      `Downloaded model file is an HTML page, not a GGUF model (${formatModelFileSize(inspection.sizeBytes ?? 0)}).\n` +
       `Something is intercepting the download from huggingface.co (a proxy, firewall, or captive portal).\n\n` +
       `Model: ${modelUri}\n` +
       `Path:  ${filePath}\n\n` +
@@ -293,7 +445,7 @@ function validateGgufFile(filePath: string, modelUri: string): void {
   }
 
   throw new Error(
-    `Model file is not valid GGUF (expected magic "GGUF", got "${got}", file is ${sizeKB} KB).\n` +
+    `Model file is not valid GGUF (expected magic "GGUF", got "${inspection.magic ?? "unknown"}", file is ${formatModelFileSize(inspection.sizeBytes ?? 0)}).\n` +
     `Model: ${modelUri}\n` +
     `Path:  ${filePath}\n\n` +
     `The file has been removed. Run the command again to re-download.`
@@ -344,6 +496,7 @@ export async function pullModels(
       }
     }
 
+    const { resolveModelFile } = await loadNodeLlamaCpp();
     const path = await resolveModelFile(model, cacheDir);
     validateGgufFile(path, model);
     const sizeBytes = existsSync(path) ? statSync(path).size : 0;
@@ -371,6 +524,16 @@ export interface LLM {
    * Get embeddings for text
    */
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
+
+  /**
+   * Get embeddings for multiple texts in a batch
+   */
+  embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]>;
+
+  /**
+   * Get the model name used for embeddings
+   */
+  getModelName(): string;
 
   /**
    * Generate text completion
@@ -438,9 +601,51 @@ export type LlamaCppConfig = {
 const DEFAULT_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_EXPAND_CONTEXT_SIZE = 2048;
 
-type LlamaGpuMode = "auto" | "metal" | "vulkan" | "cuda" | false;
+export type LlamaGpuMode = "auto" | "metal" | "vulkan" | "cuda" | false;
 
-export function resolveLlamaGpuMode(envValue = process.env.QMD_LLAMA_GPU): LlamaGpuMode {
+type ParallelismOptions = {
+  gpu: string | false;
+  platform?: NodeJS.Platform;
+  computed: number;
+  envValue?: string;
+};
+
+export function resolveParallelismOverride(envValue = process.env.QMD_EMBED_PARALLELISM): number | undefined {
+  const normalized = envValue?.trim() ?? "";
+  if (!normalized) return undefined;
+
+  const parsed = Number(normalized);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    process.stderr.write(`QMD Warning: invalid QMD_EMBED_PARALLELISM="${envValue}", using automatic parallelism.\n`);
+    return undefined;
+  }
+
+  return Math.min(8, parsed);
+}
+
+export function resolveSafeParallelism(options: ParallelismOptions): number {
+  const override = resolveParallelismOverride(options.envValue);
+  if (override !== undefined) return override;
+
+  // node-llama-cpp/llama.cpp CUDA on Windows is unstable with multiple
+  // simultaneous contexts (ggml-cuda.cu:98 in #519). Vulkan and CPU do not
+  // show the same failure mode, so only serialize Windows CUDA by default.
+  if ((options.platform ?? process.platform) === "win32" && options.gpu === "cuda") {
+    return 1;
+  }
+
+  return Math.max(1, options.computed);
+}
+
+export function resolveLlamaGpuMode(
+  envValue = process.env.QMD_LLAMA_GPU,
+  forceCpuValue = process.env.QMD_FORCE_CPU
+): LlamaGpuMode {
+  const forceCpu = forceCpuValue?.trim().toLowerCase() ?? "";
+  if (forceCpu && !["false", "off", "none", "disable", "disabled", "0"].includes(forceCpu)) {
+    return false;
+  }
+
   const normalized = envValue?.trim().toLowerCase() ?? "";
   if (!normalized) return "auto";
   if (["false", "off", "none", "disable", "disabled", "0"].includes(normalized)) return false;
@@ -448,6 +653,23 @@ export function resolveLlamaGpuMode(envValue = process.env.QMD_LLAMA_GPU): Llama
 
   process.stderr.write(`QMD Warning: invalid QMD_LLAMA_GPU="${envValue}", using auto GPU selection.\n`);
   return "auto";
+}
+
+async function disposeWithTimeout(resourceName: string, dispose: () => Promise<void>, timeoutMs = 1000): Promise<void> {
+  const timeoutPromise = new Promise<"timeout">((resolve) => {
+    setTimeout(() => resolve("timeout"), timeoutMs).unref();
+  });
+
+  try {
+    const result = await Promise.race([dispose(), timeoutPromise]);
+    if (result === "timeout") {
+      process.stderr.write(`QMD Warning: timed out disposing ${resourceName}; continuing shutdown.\n`);
+    }
+  } catch (error) {
+    process.stderr.write(
+      `QMD Warning: failed to dispose ${resourceName} (${error instanceof Error ? error.message : String(error)}); continuing shutdown.\n`
+    );
+  }
 }
 
 function resolveExpandContextSize(configValue?: number): number {
@@ -471,6 +693,14 @@ function resolveExpandContextSize(configValue?: number): number {
   return parsed;
 }
 
+const failedGpuInitModes = new Set<LlamaGpuMode>();
+let noGpuAccelerationWarningShown = false;
+let cpuForcedPrebuiltFallbackWarningShown = false;
+
+function isCpuModeRequested(): boolean {
+  return resolveLlamaGpuMode() === false;
+}
+
 export class LlamaCpp implements LLM {
   private readonly _ciMode = !!process.env.CI;
   private llama: Llama | null = null;
@@ -490,6 +720,11 @@ export class LlamaCpp implements LLM {
   private embedModelLoadPromise: Promise<LlamaModel> | null = null;
   private generateModelLoadPromise: Promise<LlamaModel> | null = null;
   private rerankModelLoadPromise: Promise<LlamaModel> | null = null;
+  // Guard against concurrent ensureLlama() calls creating duplicate Llama
+  // instances. Without this, two concurrent callers each build their own
+  // runtime and the last write to this.llama wins, leaving models/grammars
+  // bound to different Llama instances ("different Llama instance" errors).
+  private llamaLoadPromise: Promise<Llama> | null = null;
 
   // Inactivity timer for auto-unloading models
   private inactivityTimer: ReturnType<typeof setTimeout> | null = null;
@@ -501,9 +736,15 @@ export class LlamaCpp implements LLM {
 
 
   constructor(config: LlamaCppConfig = {}) {
-    this.embedModelUri = config.embedModel || process.env.QMD_EMBED_MODEL || DEFAULT_EMBED_MODEL;
-    this.generateModelUri = config.generateModel || process.env.QMD_GENERATE_MODEL || DEFAULT_GENERATE_MODEL;
-    this.rerankModelUri = config.rerankModel || process.env.QMD_RERANK_MODEL || DEFAULT_RERANK_MODEL;
+    // STRUCTURAL INVARIANT: the launcher (bin/qmd) sets GGML_METAL_NO_RESIDENCY=1
+    // on darwin BEFORE the native binding loads, which prevents the libggml-metal
+    // static destructor assertion at process exit (ggml-org/llama.cpp#22593).
+    // See isDarwinMetalMitigationActive() for the runtime check exposed to
+    // diagnostics. No constructor-time guard installation is needed.
+
+    this.embedModelUri = resolveEmbedModel({ embed: config.embedModel });
+    this.generateModelUri = resolveGenerateModel({ generate: config.generateModel });
+    this.rerankModelUri = resolveRerankModel({ rerank: config.rerankModel });
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
     this.expandContextSize = resolveExpandContextSize(config.expandContextSize);
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
@@ -511,6 +752,21 @@ export class LlamaCpp implements LLM {
   }
 
   get embedModelName(): string {
+    return this.embedModelUri;
+  }
+
+  get generateModelName(): string {
+    return this.generateModelUri;
+  }
+
+  get rerankModelName(): string {
+    return this.rerankModelUri;
+  }
+
+  /**
+   * Get the model name used for embeddings
+   */
+  getModelName(): string {
     return this.embedModelUri;
   }
 
@@ -616,41 +872,124 @@ export class LlamaCpp implements LLM {
    * Initialize the llama instance (lazy)
    */
   private async ensureLlama(allowBuild = true): Promise<Llama> {
+    if (this.llama) {
+      return this.llama;
+    }
+    if (this.llamaLoadPromise) {
+      return await this.llamaLoadPromise;
+    }
+    this.llamaLoadPromise = this.loadLlamaRuntime(allowBuild);
+    try {
+      return await this.llamaLoadPromise;
+    } finally {
+      this.llamaLoadPromise = null;
+    }
+  }
+
+  private async loadLlamaRuntime(allowBuild = true): Promise<Llama> {
     if (!this.llama) {
       const gpuMode = resolveLlamaGpuMode();
 
-      const loadLlama = async (gpu: LlamaGpuMode) =>
-        await getLlama({
-          build: allowBuild ? "autoAttempt" : "never",
+      const { getLlama, getLlamaGpuTypes, LlamaLogLevel } = await loadNodeLlamaCpp();
+      const loadLlama = async (gpu: LlamaGpuMode, sourceBuildAllowed = allowBuild, buildOverride?: "auto" | "never") =>
+        await withNativeStdoutRedirectedToStderr(() => getLlama({
+          // Prefer packaged prebuilt bindings before compiling llama.cpp locally.
+          // node-llama-cpp documents gpu:"auto" as the best default: Metal on
+          // Apple Silicon, CUDA when fully available, Vulkan where available,
+          // then CPU. Use build:"auto" for normal loads and build:"never" for
+          // diagnostic/probe paths that must not compile llama.cpp.
+          build: buildOverride ?? (sourceBuildAllowed ? "auto" : "never"),
           logLevel: LlamaLogLevel.error,
+
           gpu,
-          skipDownload: !allowBuild,
-        });
+          progressLogs: false,
+          skipDownload: !sourceBuildAllowed,
+        }));
+      const loadCpuCompatibleLlama = async () => {
+        try {
+          return await loadLlama(false, false);
+        } catch (err) {
+          // Some platforms, notably Apple Silicon, ship a Metal prebuilt but no
+          // CPU-only prebuilt. Do a fast no-build lookup for an actual CPU
+          // binding first; if it does not exist, use the packaged auto/Metal
+          // binding and disable model offloading via gpuLayers: 0.
+          if (!cpuForcedPrebuiltFallbackWarningShown) {
+            cpuForcedPrebuiltFallbackWarningShown = true;
+            process.stderr.write(
+              `QMD Warning: CPU-only llama.cpp prebuilt not available (${err instanceof Error ? err.message : String(err)}); using packaged backend with GPU offloading disabled.\n`
+            );
+          }
+          return await loadLlama("auto", false);
+        }
+      };
 
       let llama: Llama;
       if (gpuMode === false) {
-        llama = await loadLlama(false);
+        llama = await loadCpuCompatibleLlama();
+      } else if (failedGpuInitModes.has(gpuMode)) {
+        process.stderr.write(
+          `QMD Warning: skipping previously failed GPU init${gpuMode === "auto" ? "" : ` for QMD_LLAMA_GPU=${gpuMode}`}, using CPU.\n`
+        );
+        llama = await loadCpuCompatibleLlama();
       } else {
         try {
           llama = await loadLlama(gpuMode);
+
+          // If node-llama-cpp auto-detection chose CPU, do one no-build pass
+          // over all OS-valid packaged GPU backends. This preserves the
+          // documented auto mode for Metal/CUDA/Vulkan while recovering on
+          // systems where a packaged backend can load but detection is too
+          // conservative. Never compile during these extra probes.
+          if (gpuMode === "auto" && llama.gpu === false && getLlamaGpuTypes) {
+            const candidates = (await getLlamaGpuTypes("allValid"))
+              .filter((candidate): candidate is Exclude<LlamaGpuMode, "auto" | false> => candidate !== false && candidate !== "auto");
+            for (const candidate of candidates) {
+              if (failedGpuInitModes.has(candidate)) continue;
+              try {
+                const gpuLlama = await loadLlama(candidate, false, "never");
+                if (gpuLlama.gpu !== false) {
+                  await disposeWithTimeout("CPU llama runtime", () => llama.dispose());
+                  llama = gpuLlama;
+                  break;
+                }
+                await disposeWithTimeout(`${candidate} probe runtime`, () => gpuLlama.dispose());
+              } catch {
+                failedGpuInitModes.add(candidate);
+              }
+            }
+          }
         } catch (err) {
-          // GPU backend (e.g. Vulkan on headless/driverless machines) can throw at init.
-          // Fall back to CPU so qmd still works.
+          // GPU backend (e.g. Vulkan/CUDA on headless/driverless machines) can throw at init.
+          // Fall back to CPU so qmd still works, and cache the failure to avoid repeated
+          // expensive native build/probe attempts in this process.
+          failedGpuInitModes.add(gpuMode);
           process.stderr.write(
             `QMD Warning: GPU init failed${gpuMode === "auto" ? "" : ` for QMD_LLAMA_GPU=${gpuMode}`} (${err instanceof Error ? err.message : String(err)}), falling back to CPU.\n`
           );
-          llama = await loadLlama(false);
+          llama = await loadCpuCompatibleLlama();
         }
       }
 
-      if (llama.gpu === false) {
+      if (llama.gpu === false && !noGpuAccelerationWarningShown) {
+        noGpuAccelerationWarningShown = true;
         process.stderr.write(
-          "QMD Warning: no GPU acceleration, running on CPU (slow). Run 'qmd status' for details.\n"
+          "QMD Warning: no GPU acceleration, running on CPU (slow). Run 'qmd doctor' for device diagnostics.\n"
         );
       }
       this.llama = llama;
     }
     return this.llama;
+  }
+
+  private isCpuOffloadForced(): boolean {
+    return isCpuModeRequested();
+  }
+
+  private modelLoadOptions(modelPath: string): { modelPath: string; gpuLayers?: number } {
+    return {
+      modelPath,
+      ...(this.isCpuOffloadForced() ? { gpuLayers: 0 } : {}),
+    };
   }
 
   /**
@@ -661,6 +1000,8 @@ export class LlamaCpp implements LLM {
   private async resolveModel(modelUri: string): Promise<string> {
     this.ensureModelCacheDir();
     // resolveModelFile handles HF URIs and downloads to the cache dir
+
+    const { resolveModelFile } = await loadNodeLlamaCpp();
     const modelPath = await resolveModelFile(modelUri, this.modelCacheDir);
     validateGgufFile(modelPath, modelUri);
     return modelPath;
@@ -680,7 +1021,7 @@ export class LlamaCpp implements LLM {
     this.embedModelLoadPromise = (async () => {
       const llama = await this.ensureLlama();
       const modelPath = await this.resolveModel(this.embedModelUri);
-      const model = await llama.loadModel({ modelPath });
+      const model = await llama.loadModel(this.modelLoadOptions(modelPath));
       this.embedModel = model;
       // Model loading counts as activity - ping to keep alive
       this.touchActivity();
@@ -706,21 +1047,23 @@ export class LlamaCpp implements LLM {
   private async computeParallelism(perContextMB: number): Promise<number> {
     const llama = await this.ensureLlama();
 
-    if (llama.gpu) {
+    if (!this.isCpuOffloadForced() && llama.gpu) {
       try {
         const vram = await llama.getVramState();
         const freeMB = vram.free / (1024 * 1024);
         const maxByVram = Math.floor((freeMB * 0.25) / perContextMB);
-        return Math.max(1, Math.min(8, maxByVram));
+        const computed = Math.max(1, Math.min(8, maxByVram));
+        return resolveSafeParallelism({ gpu: llama.gpu, computed });
       } catch {
-        return 2;
+        return resolveSafeParallelism({ gpu: llama.gpu, computed: 2 });
       }
     }
 
     // CPU: split cores across contexts. At least 4 threads per context.
     const cores = llama.cpuMathCores || 4;
     const maxContexts = Math.floor(cores / 4);
-    return Math.max(1, Math.min(4, maxContexts));
+    const computed = Math.max(1, Math.min(4, maxContexts));
+    return resolveSafeParallelism({ gpu: false, computed });
   }
 
   /**
@@ -729,7 +1072,7 @@ export class LlamaCpp implements LLM {
    */
   private async threadsPerContext(parallelism: number): Promise<number> {
     const llama = await this.ensureLlama();
-    if (llama.gpu) return 0; // GPU: let the library decide
+    if (!this.isCpuOffloadForced() && llama.gpu) return 0; // GPU: let the library decide
     const cores = llama.cpuMathCores || 4;
     return Math.max(1, Math.floor(cores / parallelism));
   }
@@ -797,7 +1140,7 @@ export class LlamaCpp implements LLM {
       this.generateModelLoadPromise = (async () => {
         const llama = await this.ensureLlama();
         const modelPath = await this.resolveModel(this.generateModelUri);
-        const model = await llama.loadModel({ modelPath });
+        const model = await llama.loadModel(this.modelLoadOptions(modelPath));
         this.generateModel = model;
         return model;
       })();
@@ -829,7 +1172,7 @@ export class LlamaCpp implements LLM {
     this.rerankModelLoadPromise = (async () => {
       const llama = await this.ensureLlama();
       const modelPath = await this.resolveModel(this.rerankModelUri);
-      const model = await llama.loadModel({ modelPath });
+      const model = await llama.loadModel(this.modelLoadOptions(modelPath));
       this.rerankModel = model;
       // Model loading counts as activity - ping to keep alive
       this.touchActivity();
@@ -878,9 +1221,8 @@ export class LlamaCpp implements LLM {
         try {
           this.rerankContexts.push(await model.createRankingContext({
             contextSize: LlamaCpp.RERANK_CONTEXT_SIZE,
-            flashAttention: true,
             ...(threads > 0 ? { threads } : {}),
-          } as any));
+          }));
         } catch {
           if (this.rerankContexts.length === 0) {
             // Flash attention might not be supported — retry without it
@@ -1077,6 +1419,7 @@ export class LlamaCpp implements LLM {
     await this.ensureGenerateModel();
 
     // Create fresh context -> sequence -> session for each call
+    const { LlamaChatSession } = await loadNodeLlamaCpp();
     const context = await this.generateModel!.createContext();
     const sequence = context.getSequence();
     const session = new LlamaChatSession({ contextSequence: sequence });
@@ -1093,7 +1436,7 @@ export class LlamaCpp implements LLM {
         temperature,
         topK: 20,
         topP: 0.8,
-        onTextChunk: (text) => {
+        onTextChunk: (text: string) => {
           result += text;
         },
       });
@@ -1139,28 +1482,33 @@ export class LlamaCpp implements LLM {
     const includeLexical = options.includeLexical ?? true;
     const context = options.context;
 
-    const grammar = await llama.createGrammar({
-      grammar: `
-        root ::= line+
-        line ::= type ": " content "\\n"
-        type ::= "lex" | "vec" | "hyde"
-        content ::= [^\\n]+
-      `
-    });
-
     const intent = options.intent;
     const prompt = intent
       ? `/no_think Expand this search query: ${query}\nQuery intent: ${intent}`
       : `/no_think Expand this search query: ${query}`;
 
-    // Create a bounded context for expansion to prevent large default VRAM allocations.
-    const genContext = await this.generateModel!.createContext({
-      contextSize: this.expandContextSize,
-    });
-    const sequence = genContext.getSequence();
-    const session = new LlamaChatSession({ contextSequence: sequence });
-
+    // Set up inside the try so any failure (grammar creation, context
+    // allocation/VRAM, session prompt) falls back to the original query
+    // instead of propagating and failing the caller's operation.
+    let genContext: Awaited<ReturnType<LlamaModel["createContext"]>> | undefined;
     try {
+      const grammar = await llama.createGrammar({
+        grammar: `
+        root ::= line+
+        line ::= type ": " content "\\n"
+        type ::= "lex" | "vec" | "hyde"
+        content ::= [^\\n]+
+      `
+      });
+
+      // Create a bounded context for expansion to prevent large default VRAM allocations.
+      genContext = await this.generateModel!.createContext({
+        contextSize: this.expandContextSize,
+      });
+      const sequence = genContext.getSequence();
+      const { LlamaChatSession } = await loadNodeLlamaCpp();
+      const session = new LlamaChatSession({ contextSequence: sequence });
+
       // Qwen3 recommended settings for non-thinking mode:
       // temp=0.7, topP=0.8, topK=20, presence_penalty for repetition
       // DO NOT use greedy decoding (temp=0) - causes infinite loops
@@ -1213,7 +1561,7 @@ export class LlamaCpp implements LLM {
       if (includeLexical) fallback.unshift({ type: 'lex', text: query });
       return fallback;
     } finally {
-      await genContext.dispose();
+      if (genContext) await genContext.dispose();
     }
   }
 
@@ -1330,17 +1678,18 @@ export class LlamaCpp implements LLM {
     cpuCores: number;
   }> {
     const llama = await this.ensureLlama(options.allowBuild ?? true);
-    const gpuDevices = await llama.getGpuDeviceNames();
+    const cpuForced = this.isCpuOffloadForced();
+    const gpuDevices = cpuForced ? [] : await llama.getGpuDeviceNames();
     let vram: { total: number; used: number; free: number } | undefined;
-    if (llama.gpu) {
+    if (!cpuForced && llama.gpu) {
       try {
         const state = await llama.getVramState();
         vram = { total: state.total, used: state.used, free: state.free };
       } catch { /* no vram info */ }
     }
     return {
-      gpu: llama.gpu,
-      gpuOffloading: llama.supportsGpuOffloading,
+      gpu: cpuForced ? false : llama.gpu,
+      gpuOffloading: !cpuForced && llama.supportsGpuOffloading,
       gpuDevices,
       vram,
       cpuCores: llama.cpuMathCores,
@@ -1360,28 +1709,44 @@ export class LlamaCpp implements LLM {
       this.inactivityTimer = null;
     }
 
-    // Disposing llama cascades to models and contexts automatically
-    // See: https://node-llama-cpp.withcat.ai/guide/objects-lifecycle
-    // Note: llama.dispose() can hang indefinitely, so we use a timeout
-    if (this.llama) {
-      const disposePromise = this.llama.dispose();
-      const timeoutPromise = new Promise<void>((resolve) => setTimeout(resolve, 1000));
-      await Promise.race([disposePromise, timeoutPromise]);
+    // Explicitly dispose in dependency order: contexts first, then models, then llama.
+    // Relying only on llama.dispose() leaves Metal resource sets alive until process
+    // finalization on Apple Silicon, where ggml_metal_device_free can abort after
+    // otherwise-successful CLI output (#368).
+    for (const ctx of this.embedContexts) {
+      await disposeWithTimeout("embedding context", () => ctx.dispose());
+    }
+    this.embedContexts = [];
+
+    for (const ctx of this.rerankContexts) {
+      await disposeWithTimeout("rerank context", () => ctx.dispose());
+    }
+    this.rerankContexts = [];
+
+    if (this.embedModel) {
+      await disposeWithTimeout("embedding model", () => this.embedModel!.dispose());
+      this.embedModel = null;
+    }
+    if (this.generateModel) {
+      await disposeWithTimeout("generation model", () => this.generateModel!.dispose());
+      this.generateModel = null;
+    }
+    if (this.rerankModel) {
+      await disposeWithTimeout("rerank model", () => this.rerankModel!.dispose());
+      this.rerankModel = null;
     }
 
-    // Clear references
-    this.embedContexts = [];
-    this.rerankContexts = [];
-    this.embedModel = null;
-    this.generateModel = null;
-    this.rerankModel = null;
-    this.llama = null;
+    if (this.llama) {
+      await disposeWithTimeout("llama runtime", () => this.llama!.dispose());
+      this.llama = null;
+    }
 
     // Clear any in-flight load/create promises
     this.embedModelLoadPromise = null;
     this.embedContextsCreatePromise = null;
     this.generateModelLoadPromise = null;
     this.rerankModelLoadPromise = null;
+    this.llamaLoadPromise = null;
   }
 }
 
@@ -1631,13 +1996,75 @@ export function canUnloadLLM(): boolean {
 }
 
 // =============================================================================
+// Darwin Metal exit-crash mitigation
+// =============================================================================
+//
+// libggml-metal on macOS keeps allocated model memory wired via "residency
+// sets" with a 180-second keep_alive timer (added in ggml-org/llama.cpp#11427).
+// The process-static `std::vector<std::unique_ptr<ggml_metal_device>>`
+// destructor fires during libc `exit()` → `__cxa_finalize_ranges` and asserts
+// `[rsets->data count] == 0` — but the keep_alive hasn't expired, so the
+// assertion fails and `ggml_abort` dumps a multi-kilobyte stack trace to
+// stderr after the user-visible output. See ggml-org/llama.cpp#22593.
+//
+// No JS-side dispose call (`llama.dispose()`, `model.dispose()`, etc.) can
+// prevent it: the static destructor runs after every JS-reachable cleanup,
+// and `process.reallyExit` on Node calls libc `exit()` not `_exit()` (it
+// does NOT skip C++ static destructors — verified in
+// node/src/api/environment.cc).
+//
+// The actual fix is to disable residency sets via `GGML_METAL_NO_RESIDENCY=1`,
+// which we set from `bin/qmd` before Node loads the native binding. For QMD's
+// short-lived CLI workflow this has no measurable cost (subsequent calls
+// don't reuse the warm mapping). The functions below report whether that
+// mitigation is in effect — kept here, in the module that depends on the
+// underlying resource, so doctor can answer "is the protection active?"
+// without reaching into env handling directly.
+//
+// Setting `QMD_METAL_KEEP_RESIDENCY=1` opts back into residency sets (with
+// the visible-noise consequences). The legacy `QMD_DISABLE_DARWIN_SAFE_EXIT`
+// env var is accepted as a no-op alias for back-compat; it had no effect on
+// Node prior to this fix.
+
+/**
+ * Whether QMD's darwin Metal exit-crash mitigation is active in this process:
+ *   true  → residency sets disabled, process exit completes silently
+ *   false → either non-darwin, or `QMD_METAL_KEEP_RESIDENCY=1` overrode it,
+ *           in which case the libggml-metal teardown assertion may fire
+ */
+export function isDarwinMetalMitigationActive(): boolean {
+  if (process.platform !== "darwin") return false;
+  if (process.env.QMD_METAL_KEEP_RESIDENCY === "1") return false;
+  return process.env.GGML_METAL_NO_RESIDENCY === "1";
+}
+
+/**
+ * Compatibility shim: previous releases installed a `process.on('exit')` hook
+ * that tried to skip the C++ static destructor by calling `process.reallyExit`.
+ * That mechanism didn't work on Node (Environment::Exit still calls libc
+ * `exit()`), so it was replaced by `GGML_METAL_NO_RESIDENCY=1` from bin/qmd.
+ * Kept as a no-op for code paths that still call it; safe to remove once no
+ * production launcher predates the residency-set fix.
+ */
+export function installDarwinExitGuard(): void {
+  // Intentional no-op. See isDarwinMetalMitigationActive() for the real check.
+}
+
+/** @deprecated Replaced by isDarwinMetalMitigationActive. */
+export function isDarwinExitGuardInstalled(): boolean {
+  return isDarwinMetalMitigationActive();
+}
+
+// =============================================================================
 // Singleton for default LlamaCpp instance
 // =============================================================================
 
 let defaultLlamaCpp: LlamaCpp | null = null;
 
 /**
- * Get the default LlamaCpp instance (creates one if needed)
+ * Get the default LlamaCpp instance (creates one if needed). The LlamaCpp
+ * constructor installs the darwin exit guard, so any code path that obtains
+ * the singleton is protected.
  */
 export function getDefaultLlamaCpp(): LlamaCpp {
   if (!defaultLlamaCpp) {
@@ -1647,10 +2074,22 @@ export function getDefaultLlamaCpp(): LlamaCpp {
 }
 
 /**
- * Set a custom default LlamaCpp instance (useful for testing)
+ * Set a custom default LlamaCpp instance (useful for testing). Setting a
+ * non-null instance also ensures the darwin exit guard is installed — keeps
+ * the invariant intact for test doubles that didn't go through the real
+ * constructor.
  */
 export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
+  if (llm !== null) installDarwinExitGuard();
   defaultLlamaCpp = llm;
+}
+
+/**
+ * Peek at the default LlamaCpp instance without instantiating one. Used by
+ * doctor and lifecycle diagnostics.
+ */
+export function hasDefaultLlamaCpp(): boolean {
+  return defaultLlamaCpp !== null;
 }
 
 /**
@@ -1662,4 +2101,131 @@ export async function disposeDefaultLlamaCpp(): Promise<void> {
     await defaultLlamaCpp.dispose();
     defaultLlamaCpp = null;
   }
+}
+
+// =============================================================================
+// OpenAI Embedding Support
+// =============================================================================
+
+import { OpenAIEmbedding, type OpenAIConfig } from "./openai-llm.js";
+
+/**
+ * Embedding provider configuration
+ */
+export type EmbeddingProvider = 'local' | 'openai';
+
+export type EmbeddingConfig = {
+  provider: EmbeddingProvider;
+  openai?: OpenAIConfig;
+};
+
+// Default embedding config: use local llama-cpp
+let embeddingConfig: EmbeddingConfig = { provider: 'local' };
+let openAIEmbedding: OpenAIEmbedding | null = null;
+
+/**
+ * Set the embedding configuration. Call before using embeddings.
+ */
+export function setEmbeddingConfig(config: EmbeddingConfig): void {
+  embeddingConfig = config;
+  // Reset OpenAI instance if config changes
+  openAIEmbedding = null;
+}
+
+/**
+ * Get the current embedding configuration
+ */
+export function getEmbeddingConfig(): EmbeddingConfig {
+  return embeddingConfig;
+}
+
+/**
+ * Check if using OpenAI for embeddings
+ */
+export function isUsingOpenAI(): boolean {
+  return embeddingConfig.provider === 'openai';
+}
+
+/**
+ * Get the appropriate LLM for embeddings based on config.
+ * Returns OpenAI embedding client if configured, otherwise local LlamaCpp.
+ */
+export function getDefaultEmbeddingLLM(): LLM {
+  if (embeddingConfig.provider === 'openai') {
+    if (!openAIEmbedding) {
+      openAIEmbedding = new OpenAIEmbedding(embeddingConfig.openai);
+    }
+    return openAIEmbedding;
+  }
+  return getDefaultLlamaCpp();
+}
+
+/**
+ * Lightweight ILLMSession wrapper for OpenAI — no LlamaCpp session manager needed.
+ */
+class OpenAILLMSession implements ILLMSession {
+  private llm: OpenAIEmbedding;
+  private abortController = new AbortController();
+  private released = false;
+  private maxDurationTimer: ReturnType<typeof setTimeout> | null = null;
+
+  constructor(llm: OpenAIEmbedding, options: LLMSessionOptions = {}) {
+    this.llm = llm;
+    const maxDuration = options.maxDuration ?? 10 * 60 * 1000;
+    if (maxDuration > 0) {
+      this.maxDurationTimer = setTimeout(() => {
+        this.abortController.abort(new Error("OpenAI session exceeded max duration"));
+      }, maxDuration);
+      this.maxDurationTimer.unref();
+    }
+  }
+
+  get isValid(): boolean { return !this.released && !this.abortController.signal.aborted; }
+  get signal(): AbortSignal { return this.abortController.signal; }
+
+  release(): void {
+    if (this.released) return;
+    this.released = true;
+    if (this.maxDurationTimer) { clearTimeout(this.maxDurationTimer); this.maxDurationTimer = null; }
+    this.abortController.abort(new Error("Session released"));
+  }
+
+  async embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
+    return this.llm.embed(text, options);
+  }
+
+  async embedBatch(texts: string[], _options?: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
+    return this.llm.embedBatch(texts);
+  }
+
+  async expandQuery(query: string, options?: { context?: string; includeLexical?: boolean }): Promise<Queryable[]> {
+    return this.llm.expandQuery(query, options);
+  }
+
+  async rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult> {
+    return this.llm.rerank(query, documents, options);
+  }
+}
+
+/**
+ * Execute a function with the correct session type based on embedding provider.
+ * OpenAI mode: lightweight wrapper, no node-llama-cpp loaded.
+ * Local mode: full LlamaCpp session with resource management.
+ */
+export async function withEmbeddingSession<T>(
+  fn: (session: ILLMSession, modelName: string) => Promise<T>,
+  options?: LLMSessionOptions & { storeLlm?: LlamaCpp }
+): Promise<T> {
+  if (isUsingOpenAI()) {
+    const llm = getDefaultEmbeddingLLM() as OpenAIEmbedding;
+    const session = new OpenAILLMSession(llm, options);
+    try {
+      return await fn(session, llm.getModelName());
+    } finally {
+      session.release();
+    }
+  }
+
+  const llm = options?.storeLlm ?? getDefaultLlamaCpp();
+  return withLLMSessionForLlm(llm, (session) => fn(session, llm.embedModelName), options);
 }

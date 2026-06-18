@@ -22,7 +22,7 @@ import {
   type VectorSearchOptions,
   type ExpandQueryOptions,
 } from "../src/index.js";
-import { setDefaultLlamaCpp } from "../src/llm.js";
+import { getEmbeddingConfig, setDefaultLlamaCpp, setEmbeddingConfig } from "../src/llm.js";
 
 // =============================================================================
 // Test Helpers
@@ -66,6 +66,14 @@ function freshDbPath(): string {
 // =============================================================================
 
 describe("createStore", () => {
+  afterEach(() => {
+    delete process.env.QMD_OPENAI;
+    delete process.env.QMD_OPENAI_API_KEY;
+    delete process.env.QMD_OPENAI_BASE_URL;
+    delete process.env.QMD_OPENAI_EMBED_MODEL;
+    setEmbeddingConfig({ provider: "local" });
+  });
+
   test("creates store with inline config", async () => {
     const store = await createStore({
       dbPath: freshDbPath(),
@@ -144,6 +152,60 @@ describe("createStore", () => {
     });
 
     expect(store.dbPath).toBe(dbPath);
+    await store.close();
+  });
+
+  test("applies OpenAI embedding config in inline SDK mode", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: {
+        collections: {},
+        embedding: {
+          provider: "openai",
+          openai: {
+            api_key: "inline-key",
+            model: "text-embedding-3-small",
+            expansion_model: "gpt-4o-mini",
+            rerank_model: "rerank-v3",
+            base_url: "http://localhost:11434/v1",
+          },
+        },
+      },
+    });
+
+    expect(getEmbeddingConfig()).toMatchObject({
+      provider: "openai",
+      openai: {
+        apiKey: "inline-key",
+        embedModel: "text-embedding-3-small",
+        expansionModel: "gpt-4o-mini",
+        rerankModel: "rerank-v3",
+        baseURL: "http://localhost:11434/v1",
+      },
+    });
+
+    await store.close();
+  });
+
+  test("activates OpenAI embedding config from SDK env vars", async () => {
+    process.env.QMD_OPENAI_BASE_URL = "http://localhost:8080/v1";
+    process.env.QMD_OPENAI_API_KEY = "env-key";
+    process.env.QMD_OPENAI_EMBED_MODEL = "nomic-embed-text";
+
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: { collections: {} },
+    });
+
+    expect(getEmbeddingConfig()).toMatchObject({
+      provider: "openai",
+      openai: {
+        apiKey: "env-key",
+        embedModel: "nomic-embed-text",
+        baseURL: "http://localhost:8080/v1",
+      },
+    });
+
     await store.close();
   });
 });
@@ -614,6 +676,20 @@ describe("search (unified API)", () => {
     expect(results.length).toBeGreaterThan(0);
   });
 
+  test("search() forwards candidateLimit to structured search", async () => {
+    const results = await store.search({
+      queries: [
+        { type: "lex", query: "authentication" },
+        { type: "lex", query: "meeting" },
+      ],
+      limit: 5,
+      candidateLimit: 1,
+      rerank: false,
+    });
+
+    expect(results).toHaveLength(1);
+  });
+
   // Tests below use search({ query: ... }) which triggers LLM query expansion
   describe.skipIf(!!process.env.CI)("with LLM query expansion", () => {
     test("search() with query and rerank:false returns results", async () => {
@@ -976,6 +1052,92 @@ describe("embed", () => {
       expect(fakeLlm.embedBatchCalls.map(call => call.length)).toEqual([1, 1, 1]);
       expect(result.docsProcessed).toBe(3);
       expect(result.chunksEmbedded).toBe(3);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await store.close();
+    }
+  });
+
+  test("store.embed scopes pending documents to the requested collection", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: {
+        collections: {
+          docs: { path: docsDir, pattern: "**/*.md" },
+          notes: { path: notesDir, pattern: "**/*.md" },
+        },
+      },
+    });
+
+    const fakeLlm = createFakeEmbedLlm();
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.internal.llm = fakeLlm as any;
+
+    try {
+      await store.update();
+      const result = await store.embed({ collection: "docs" });
+
+      const vectorCounts = store.internal.db.prepare(`
+        SELECT d.collection, COUNT(DISTINCT v.hash) AS count
+        FROM documents d
+        LEFT JOIN content_vectors v ON v.hash = d.hash AND v.seq = 0
+        WHERE d.active = 1
+        GROUP BY d.collection
+        ORDER BY d.collection
+      `).all() as Array<{ collection: string; count: number }>;
+
+      expect(result.docsProcessed).toBe(3);
+      expect(result.chunksEmbedded).toBe(3);
+      expect(vectorCounts).toEqual([
+        { collection: "docs", count: 3 },
+        { collection: "notes", count: 0 },
+      ]);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await store.close();
+    }
+  });
+
+  test("store.embed with force only clears the requested collection", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: {
+        collections: {
+          docs: { path: docsDir, pattern: "**/*.md" },
+          notes: { path: notesDir, pattern: "**/*.md" },
+        },
+      },
+    });
+
+    const fakeLlm = createFakeEmbedLlm();
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.internal.llm = fakeLlm as any;
+
+    const vectorCounts = () => store.internal.db.prepare(`
+      SELECT d.collection, COUNT(DISTINCT v.hash) AS count
+      FROM documents d
+      LEFT JOIN content_vectors v ON v.hash = d.hash AND v.seq = 0
+      WHERE d.active = 1
+      GROUP BY d.collection
+      ORDER BY d.collection
+    `).all() as Array<{ collection: string; count: number }>;
+
+    try {
+      await store.update();
+      await store.embed();
+      expect(vectorCounts()).toEqual([
+        { collection: "docs", count: 3 },
+        { collection: "notes", count: 3 },
+      ]);
+
+      const result = await store.embed({ force: true, collection: "docs" });
+
+      expect(result.docsProcessed).toBe(3);
+      expect(result.chunksEmbedded).toBe(3);
+      expect(vectorCounts()).toEqual([
+        { collection: "docs", count: 3 },
+        { collection: "notes", count: 3 },
+      ]);
     } finally {
       setDefaultLlamaCpp(null);
       await store.close();
