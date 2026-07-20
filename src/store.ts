@@ -55,6 +55,7 @@ export const DEFAULT_MULTI_GET_MAX_BYTES = 10 * 1024; // 10KB
 export const DEFAULT_EMBED_MAX_DOCS_PER_BATCH = 64;
 export const DEFAULT_EMBED_MAX_BATCH_BYTES = 64 * 1024 * 1024; // 64MB
 export const DEFAULT_EMBED_CLAIM_TTL_MS = 60 * 60 * 1000;
+export const DEFAULT_SCOPED_VECTOR_EXACT_LIMIT = 5_000;
 
 const EMBED_FINGERPRINT_PROBE_QUERY = "__qmd_embedding_query_probe__";
 const EMBED_FINGERPRINT_PROBE_TITLE = "__qmd_embedding_title_probe__";
@@ -92,6 +93,10 @@ function parseNonNegativeIntegerEnv(name: string, fallback: number): number {
 
 function getEmbedClaimTtlMs(): number {
   return parseNonNegativeIntegerEnv("QMD_EMBED_CLAIM_TTL_MS", DEFAULT_EMBED_CLAIM_TTL_MS);
+}
+
+function getScopedVectorExactLimit(): number {
+  return parseNonNegativeIntegerEnv("QMD_SCOPED_VECTOR_EXACT_LIMIT", DEFAULT_SCOPED_VECTOR_EXACT_LIMIT);
 }
 
 // Chunking: 900 tokens per chunk with 15% overlap
@@ -3892,31 +3897,106 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collections?: string | string[], session?: ILLMSession, precomputedEmbedding?: number[]): Promise<SearchResult[]> {
-  const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
-  if (!tableExists) return [];
+type VectorMatch = { hash_seq: string; distance: number };
 
-  const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session);
-  if (!embedding) return [];
+function decodeSqliteVector(value: unknown): Float32Array | null {
+  if (value instanceof Float32Array) return value;
+  if (value instanceof Uint8Array) {
+    const byteLength = value.byteLength - (value.byteLength % Float32Array.BYTES_PER_ELEMENT);
+    if (byteLength <= 0) return null;
+    if (value.byteOffset % Float32Array.BYTES_PER_ELEMENT === 0) {
+      return new Float32Array(value.buffer, value.byteOffset, byteLength / Float32Array.BYTES_PER_ELEMENT);
+    }
+    const aligned = Uint8Array.from(value.subarray(0, byteLength));
+    return new Float32Array(aligned.buffer);
+  }
+  if (Array.isArray(value)) return new Float32Array(value);
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      if (Array.isArray(parsed)) return new Float32Array(parsed);
+    } catch {}
+  }
+  return null;
+}
 
-  // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
-  // hang indefinitely when combined with JOINs in the same query. Do NOT try to
-  // "optimize" this by combining into a single query with JOINs - it will break.
-  // See: https://github.com/tobi/qmd/pull/23
+function cosineDistance(a: number[] | Float32Array, b: Float32Array): number | null {
+  if (a.length === 0 || a.length !== b.length) return null;
 
-  // Step 1: Get vector matches from sqlite-vec (no JOINs allowed)
-  const collectionCount = normalizeCollectionFilter(collections).length;
-  const vecCandidateLimit = collectionCount > 0
-    ? Math.max(limit * 100, 1000)
-    : limit * 3;
-  const vecResults = db.prepare(`
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    const av = a[i] ?? 0;
+    const bv = b[i] ?? 0;
+    dot += av * bv;
+    normA += av * av;
+    normB += bv * bv;
+  }
+  if (normA === 0 || normB === 0) return 1;
+  const similarity = dot / (Math.sqrt(normA) * Math.sqrt(normB));
+  return 1 - Math.max(-1, Math.min(1, similarity));
+}
+
+function getGlobalVectorMatches(db: Database, embedding: number[], limit: number): VectorMatch[] {
+  return db.prepare(`
     SELECT hash_seq, distance
     FROM vectors_vec
     WHERE embedding MATCH ? AND k = ?
-  `).all(new Float32Array(embedding), vecCandidateLimit) as { hash_seq: string; distance: number }[];
+  `).all(new Float32Array(embedding), limit) as VectorMatch[];
+}
 
+function getScopedVectorHashSeqs(db: Database, collections: string[], maxRows: number): string[] {
+  const collectionFilter = buildCollectionSql(collections, "d");
+  const sql = `
+    SELECT DISTINCT cv.hash || '_' || cv.seq as hash_seq
+    FROM content_vectors cv
+    JOIN documents d ON d.hash = cv.hash AND d.active = 1
+    WHERE 1 = 1
+    ${collectionFilter.sql}
+    LIMIT ?
+  `;
+  return withLazyContentVectorMigration(db, () => (
+    db.prepare(sql).all(...collectionFilter.params, maxRows) as { hash_seq: string }[]
+  )).map(row => row.hash_seq);
+}
+
+function getScopedVectorMatches(db: Database, embedding: number[], collections: string[], limit: number): VectorMatch[] | null {
+  const exactLimit = getScopedVectorExactLimit();
+  const scopedHashSeqs = getScopedVectorHashSeqs(db, collections, exactLimit + 1);
+  if (scopedHashSeqs.length === 0) return [];
+  if (scopedHashSeqs.length > exactLimit) return null;
+
+  const matches: VectorMatch[] = [];
+  const batchSize = 500;
+  for (let i = 0; i < scopedHashSeqs.length; i += batchSize) {
+    const batch = scopedHashSeqs.slice(i, i + batchSize);
+    const placeholders = batch.map(() => "?").join(",");
+    const rows = db.prepare(`
+      SELECT hash_seq, embedding
+      FROM vectors_vec
+      WHERE hash_seq IN (${placeholders})
+    `).all(...batch) as { hash_seq: string; embedding: unknown }[];
+
+    for (const row of rows) {
+      const vector = decodeSqliteVector(row.embedding);
+      if (!vector) continue;
+      const distance = cosineDistance(embedding, vector);
+      if (distance === null) continue;
+      matches.push({
+        hash_seq: row.hash_seq,
+        distance,
+      });
+    }
+  }
+
+  return matches
+    .sort((a, b) => a.distance - b.distance)
+    .slice(0, Math.min(matches.length, Math.max(limit * 20, 200)));
+}
+
+function hydrateVectorMatches(db: Database, vecResults: VectorMatch[], limit: number, collections?: string | string[]): SearchResult[] {
   if (vecResults.length === 0) return [];
-
   // Step 2: Get chunk info and document data
   const hashSeqs = vecResults.map(r => r.hash_seq);
   const distanceMap = new Map(vecResults.map(r => [r.hash_seq, r.distance]));
@@ -3979,6 +4059,25 @@ export async function searchVec(db: Database, query: string, model: string, limi
         chunkPos: row.pos,
       };
     });
+}
+
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collections?: string | string[], session?: ILLMSession, precomputedEmbedding?: number[]): Promise<SearchResult[]> {
+  const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
+  if (!tableExists) return [];
+
+  const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session);
+  if (!embedding) return [];
+
+  // IMPORTANT: sqlite-vec virtual tables can hang indefinitely when KNN MATCH
+  // is combined with JOINs. Keep vector lookup and document hydration separate.
+  // See: https://github.com/tobi/qmd/pull/23
+  const normalizedCollections = normalizeCollectionFilter(collections);
+  const vecResults = normalizedCollections.length > 0
+    ? getScopedVectorMatches(db, embedding, normalizedCollections, limit)
+    : getGlobalVectorMatches(db, embedding, limit * 3);
+
+  if (!vecResults || vecResults.length === 0) return [];
+  return hydrateVectorMatches(db, vecResults, limit, normalizedCollections);
 }
 
 // =============================================================================

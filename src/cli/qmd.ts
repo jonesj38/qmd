@@ -133,16 +133,15 @@ function getStore(): ReturnType<typeof createStore> {
     store = createStore(storeDbPathOverride);
     // Sync YAML config into SQLite store_collections so store.ts reads from DB
     try {
-      const activeModels = ensureModelsConfiguredForCli();
       const config = loadConfig();
       syncConfigToDb(store.db, config);
-      setDefaultLlamaCpp(new LlamaCpp({
-        embedModel: activeModels.embed,
-        generateModel: activeModels.generate,
-        rerankModel: activeModels.rerank,
-      }));
     } catch {
       // Config may not exist yet — that's fine, DB works without it
+    }
+    try {
+      configureDefaultLlamaCppForCli();
+    } catch {
+      // OpenAI/FTS-only paths can run without local model config.
     }
   }
   return store;
@@ -153,12 +152,7 @@ function getReadOnlyStore(): ReturnType<typeof createStore> {
   if (!readOnlyStore) {
     readOnlyStore = createStore(storeDbPathOverride, { readonly: true });
     try {
-      const activeModels = ensureModelsConfiguredForCli();
-      setDefaultLlamaCpp(new LlamaCpp({
-        embedModel: activeModels.embed,
-        generateModel: activeModels.generate,
-        rerankModel: activeModels.rerank,
-      }));
+      configureDefaultLlamaCppForCli();
     } catch {
       // Query-only mode can run without model config for plain FTS searches.
     }
@@ -2037,6 +2031,28 @@ function ensureModelsConfiguredForCli(): { embed: string; generate: string; rera
   } catch {
     return resolveModels();
   }
+}
+
+type CliLlamaConfiguratorDeps = {
+  isOpenAI?: () => boolean;
+  ensureModels?: () => { embed: string; generate: string; rerank: string };
+  makeLlamaCpp?: (models: { embed: string; generate: string; rerank: string }) => LlamaCpp;
+  setDefault?: (llm: LlamaCpp) => void;
+};
+
+export function configureDefaultLlamaCppForCli(deps: CliLlamaConfiguratorDeps = {}): boolean {
+  const usingOpenAI = deps.isOpenAI ?? isUsingOpenAI;
+  if (usingOpenAI()) return false;
+
+  const ensureModels = deps.ensureModels ?? ensureModelsConfiguredForCli;
+  const makeLlamaCpp = deps.makeLlamaCpp ?? ((models) => new LlamaCpp({
+    embedModel: models.embed,
+    generateModel: models.generate,
+    rerankModel: models.rerank,
+  }));
+  const setDefault = deps.setDefault ?? setDefaultLlamaCpp;
+  setDefault(makeLlamaCpp(ensureModels()));
+  return true;
 }
 
 export function resolveEmbedModelForCli(): string {

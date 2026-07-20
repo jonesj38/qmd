@@ -1,8 +1,54 @@
-import { describe, expect, test } from "vitest";
-import { finishSuccessfulCliCommand } from "../src/cli/qmd.ts";
+import { describe, expect, test, vi } from "vitest";
+import { configureDefaultLlamaCppForCli, finishSuccessfulCliCommand } from "../src/cli/qmd.ts";
 import { LlamaCpp, isDarwinMetalMitigationActive } from "../src/llm.ts";
 
 describe("CLI successful-exit lifecycle", () => {
+  test("OpenAI mode skips local LlamaCpp singleton configuration", () => {
+    const ensureModels = vi.fn(() => {
+      throw new Error("local model resolution should not run");
+    });
+    const makeLlamaCpp = vi.fn(() => {
+      throw new Error("local LlamaCpp should not be constructed");
+    });
+    const setDefault = vi.fn();
+
+    const configured = configureDefaultLlamaCppForCli({
+      isOpenAI: () => true,
+      ensureModels,
+      makeLlamaCpp: makeLlamaCpp as any,
+      setDefault: setDefault as any,
+    });
+
+    expect(configured).toBe(false);
+    expect(ensureModels).not.toHaveBeenCalled();
+    expect(makeLlamaCpp).not.toHaveBeenCalled();
+    expect(setDefault).not.toHaveBeenCalled();
+  });
+
+  test("local mode configures the local LlamaCpp singleton", () => {
+    const models = {
+      embed: "embed.gguf",
+      generate: "generate.gguf",
+      rerank: "rerank.gguf",
+    };
+    const fakeLlama = { kind: "fake-llama" };
+    const ensureModels = vi.fn(() => models);
+    const makeLlamaCpp = vi.fn(() => fakeLlama);
+    const setDefault = vi.fn();
+
+    const configured = configureDefaultLlamaCppForCli({
+      isOpenAI: () => false,
+      ensureModels,
+      makeLlamaCpp: makeLlamaCpp as any,
+      setDefault: setDefault as any,
+    });
+
+    expect(configured).toBe(true);
+    expect(ensureModels).toHaveBeenCalledTimes(1);
+    expect(makeLlamaCpp).toHaveBeenCalledWith(models);
+    expect(setDefault).toHaveBeenCalledWith(fakeLlama);
+  });
+
   test("exits 0 after successful output when post-output LLM cleanup fails", async () => {
     const exitCodes: number[] = [];
     const stderr: string[] = [];

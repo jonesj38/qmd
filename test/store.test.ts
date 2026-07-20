@@ -3582,6 +3582,135 @@ describe("Embedding batching", () => {
     }
   });
 
+  test("searchVec returns selected collection vectors absent from old global candidate window", async () => {
+    const store = await createTestStore();
+    const targetCollection = await createTestCollection({ name: "artifact", pwd: "/test/artifact" });
+    const distractorCollection = await createTestCollection({ name: "source", pwd: "/test/source" });
+    const model = "test-model";
+    const now = new Date().toISOString();
+
+    try {
+      store.ensureVecTable(3);
+      await insertTestDocument(store.db, targetCollection, {
+        name: "target",
+        hash: "targethash",
+        displayPath: "target.md",
+        body: "target artifact document",
+      });
+      store.insertEmbedding("targethash", 0, 0, new Float32Array([0.8, 0.6, 0]), model, now);
+
+      for (let i = 0; i < 1005; i++) {
+        const hash = `distractor${i}`;
+        await insertTestDocument(store.db, distractorCollection, {
+          name: `distractor-${i}`,
+          hash,
+          displayPath: `distractor-${i}.md`,
+          body: `global distractor ${i}`,
+        });
+        store.insertEmbedding(hash, 0, 0, new Float32Array([1, 0, 0]), model, now);
+      }
+
+      const results = await store.searchVec(
+        "semantic artifact",
+        model,
+        1,
+        targetCollection,
+        undefined,
+        [1, 0, 0],
+      );
+
+      expect(results).toHaveLength(1);
+      expect(results[0]?.filepath).toBe(`qmd://${targetCollection}/target.md`);
+      expect(results[0]?.collectionName).toBe(targetCollection);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("searchVec uses bounded empty fallback when selected scope exceeds exact vector limit", async () => {
+    const previousLimit = process.env.QMD_SCOPED_VECTOR_EXACT_LIMIT;
+    process.env.QMD_SCOPED_VECTOR_EXACT_LIMIT = "1";
+    const store = await createTestStore();
+    const collection = await createTestCollection({ name: "large-scope", pwd: "/test/large-scope" });
+    const model = "test-model";
+    const now = new Date().toISOString();
+
+    try {
+      store.ensureVecTable(3);
+      for (let i = 0; i < 2; i++) {
+        const hash = `largehash${i}`;
+        await insertTestDocument(store.db, collection, {
+          name: `large-${i}`,
+          hash,
+          displayPath: `large-${i}.md`,
+          body: `large scope ${i}`,
+        });
+        store.insertEmbedding(hash, 0, 0, new Float32Array([1, 0, 0]), model, now);
+      }
+
+      const startedAt = Date.now();
+      const results = await store.searchVec(
+        "large scope",
+        model,
+        10,
+        collection,
+        undefined,
+        [1, 0, 0],
+      );
+
+      expect(results).toEqual([]);
+      expect(Date.now() - startedAt).toBeLessThan(500);
+    } finally {
+      if (previousLimit === undefined) delete process.env.QMD_SCOPED_VECTOR_EXACT_LIMIT;
+      else process.env.QMD_SCOPED_VECTOR_EXACT_LIMIT = previousLimit;
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("hybridQuery uses available selected vectors while lexical-only docs remain useful", async () => {
+    const store = await createTestStore();
+    const collection = await createTestCollection({ name: "artifact", pwd: "/test/artifact" });
+    const model = "test-model";
+    const now = new Date().toISOString();
+
+    try {
+      await insertTestDocument(store.db, collection, {
+        name: "lexical",
+        hash: "lexicalpartialhash",
+        displayPath: "lexical.md",
+        body: "partial fallback lexical evidence",
+      });
+      await insertTestDocument(store.db, collection, {
+        name: "vector",
+        hash: "vectorpartialhash",
+        displayPath: "vector.md",
+        body: "unrelated semantic-only evidence",
+      });
+      store.ensureVecTable(3);
+      store.insertEmbedding("vectorpartialhash", 0, 0, new Float32Array([1, 0, 0]), model, now);
+
+      store.llm = {
+        embedModelName: model,
+        embedBatch: vi.fn(async () => [{ embedding: [1, 0, 0], model }]),
+      } as any;
+      store.expandQuery = vi.fn(async () => []) as any;
+
+      const results = await hybridQuery(store, "partial fallback", {
+        collection,
+        limit: 5,
+        minScore: 0,
+        skipRerank: true,
+      });
+
+      expect(results.map(r => r.file).sort()).toEqual([
+        `qmd://${collection}/lexical.md`,
+        `qmd://${collection}/vector.md`,
+      ]);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
   test("hybridQuery returns useful degraded results when only some docs have vectors", async () => {
     const store = await createTestStore();
     const model = "hf:test/embed-model.gguf";
