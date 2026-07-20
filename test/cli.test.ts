@@ -48,10 +48,28 @@ async function runQmd(
   const dbPath = options.dbPath || testDbPath;
   const configDir = options.configDir || testConfigDir;
   const runner = qmdRunnerArgs(args);
+  const childEnv: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of [
+    "OPENAI_API_KEY",
+    "QMD_OPENAI",
+    "QMD_OPENAI_API_KEY",
+    "QMD_OPENAI_BASE_URL",
+    "QMD_OPENAI_CHAT_API_KEY",
+    "QMD_OPENAI_CHAT_BASE_URL",
+    "QMD_OPENAI_RERANK_API_KEY",
+    "QMD_OPENAI_RERANK_BASE_URL",
+    "QMD_EMBED_MODEL",
+    "QMD_GENERATE_MODEL",
+    "QMD_RERANK_MODEL",
+  ]) {
+    if (!(key in (options.env ?? {}))) {
+      delete childEnv[key];
+    }
+  }
   const proc = spawn(runner.command, runner.args, {
     cwd: workingDir,
     env: {
-      ...process.env,
+      ...childEnv,
       INDEX_PATH: dbPath,
       QMD_CONFIG_DIR: configDir, // Use test config directory
       PWD: workingDir, // Must explicitly set PWD since getPwd() checks this
@@ -965,6 +983,41 @@ describe("CLI Update Command", () => {
     expect(stdout).toContain("Updating 1 collection(s)");
     expect(stdout).toContain("second");
     expect(stdout).not.toContain("first (**/*.md)");
+  });
+
+  test("updates every collection requested by repeated -c", async () => {
+    const { dbPath, configDir } = await createIsolatedTestEnv("update-filter-repeat");
+    const firstDir = join(testDir, `update-filter-repeat-first-${Date.now()}`);
+    const secondDir = join(testDir, `update-filter-repeat-second-${Date.now()}`);
+    const thirdDir = join(testDir, `update-filter-repeat-third-${Date.now()}`);
+    await mkdir(firstDir, { recursive: true });
+    await mkdir(secondDir, { recursive: true });
+    await mkdir(thirdDir, { recursive: true });
+    await writeFile(join(firstDir, "first.md"), "# First\n");
+    await writeFile(join(secondDir, "second.md"), "# Second\n");
+    await writeFile(join(thirdDir, "third.md"), "# Third\n");
+
+    expect((await runQmd(["collection", "add", firstDir, "--name", "first-repeat"], { dbPath, configDir })).exitCode).toBe(0);
+    expect((await runQmd(["collection", "add", secondDir, "--name", "second-repeat"], { dbPath, configDir })).exitCode).toBe(0);
+    expect((await runQmd(["collection", "add", thirdDir, "--name", "third-repeat"], { dbPath, configDir })).exitCode).toBe(0);
+
+    await writeFile(join(firstDir, "first-new.md"), "# First New\n");
+    await writeFile(join(secondDir, "second-new.md"), "# Second New\n");
+    await writeFile(join(thirdDir, "third-new.md"), "# Third New\n");
+
+    const { stdout, exitCode } = await runQmd(["update", "-c", "first-repeat", "-c", "second-repeat"], { dbPath, configDir });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Updating 2 collection(s)");
+    expect(stdout).toContain("first-repeat");
+    expect(stdout).toContain("second-repeat");
+    expect(stdout).not.toContain("third-repeat (**/*.md)");
+
+    const firstSearch = await runQmd(["search", "First New", "-c", "first-repeat", "--format", "files"], { dbPath, configDir });
+    const secondSearch = await runQmd(["search", "Second New", "-c", "second-repeat", "--format", "files"], { dbPath, configDir });
+    const thirdSearch = await runQmd(["search", "Third New", "-c", "third-repeat", "--format", "files"], { dbPath, configDir });
+    expect(firstSearch.stdout).toContain("qmd://first-repeat/first-new.md");
+    expect(secondSearch.stdout).toContain("qmd://second-repeat/second-new.md");
+    expect(thirdSearch.stdout).not.toContain("qmd://third-repeat/third-new.md");
   });
 
   test("deactivates stale docs when collection has zero matching files", async () => {

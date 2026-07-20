@@ -53,6 +53,7 @@ import {
   insertContent,
   insertDocument,
   generateEmbeddings,
+  getHashesNeedingEmbedding,
   getHybridRrfWeights,
   _resetProductionModeForTesting,
   hybridQuery,
@@ -3146,6 +3147,64 @@ describe("Edge Cases", () => {
 
     await cleanupTestDb(store);
   });
+
+  test("concurrent collection maintenance serializes commits without omitting collections", async () => {
+    const store = await createTestStore();
+    const dirA = await mkdtemp(join(testDir, "maint-a-"));
+    const dirB = await mkdtemp(join(testDir, "maint-b-"));
+
+    try {
+      await writeFile(join(dirA, "alpha.md"), "# Alpha\n\nshared maintenance query alpha");
+      await writeFile(join(dirB, "bravo.md"), "# Bravo\n\nshared maintenance query bravo");
+      await createTestCollection({ pwd: dirA, name: "maint-a" });
+      await createTestCollection({ pwd: dirB, name: "maint-b" });
+
+      const [resultA, resultB] = await Promise.all([
+        reindexCollection(store, dirA, "**/*.md", "maint-a"),
+        reindexCollection(store, dirB, "**/*.md", "maint-b"),
+      ]);
+
+      expect(resultA.indexed).toBe(1);
+      expect(resultB.indexed).toBe(1);
+      expect(store.searchFTS("maintenance alpha", 5, ["maint-a"])[0]?.displayPath).toBe("maint-a/alpha.md");
+      expect(store.searchFTS("maintenance bravo", 5, ["maint-b"])[0]?.displayPath).toBe("maint-b/bravo.md");
+    } finally {
+      await rm(dirA, { recursive: true, force: true });
+      await rm(dirB, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("read-only queries remain available while a writer transaction is open", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection({ name: "readable" });
+
+    try {
+      await insertTestDocument(store.db, collectionName, {
+        name: "visible",
+        body: "# Visible\n\nread availability during writes",
+        displayPath: "visible.md",
+      });
+
+      store.db.exec("BEGIN IMMEDIATE");
+      try {
+        store.db.prepare(`INSERT INTO content(hash, doc, created_at) VALUES (?, ?, ?)`)
+          .run("pending-hash", "# Pending\n\nuncommitted", new Date().toISOString());
+
+        const reader = createStore(store.dbPath, { readonly: true });
+        try {
+          const results = reader.searchFTS("read availability", 5, "readable");
+          expect(results[0]?.displayPath).toBe("readable/visible.md");
+        } finally {
+          reader.close();
+        }
+      } finally {
+        store.db.exec("ROLLBACK");
+      }
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
 });
 
 describe("Embedding batching", () => {
@@ -3259,7 +3318,7 @@ describe("Embedding batching", () => {
       const result = await generateEmbeddings(store, { model });
 
       expect(result.chunksEmbedded).toBe(1);
-      expect(fakeLlm.embedCalls[0]?.options?.model).toBe(model);
+      expect(fakeLlm.embedCalls).toEqual([]);
       expect(fakeLlm.embedBatchModelCalls).toEqual([{ model }]);
       expect(db.prepare(`SELECT DISTINCT model FROM content_vectors`).all()).toEqual([{ model }]);
     } finally {
@@ -3283,7 +3342,7 @@ describe("Embedding batching", () => {
       const result = await generateEmbeddings(store);
 
       expect(result.chunksEmbedded).toBe(1);
-      expect(fakeLlm.embedCalls[0]?.options?.model).toBe(model);
+      expect(fakeLlm.embedCalls).toEqual([]);
       expect(fakeLlm.embedBatchModelCalls).toEqual([{ model }]);
       expect(db.prepare(`SELECT DISTINCT model FROM content_vectors`).all()).toEqual([{ model }]);
     } finally {
@@ -3395,6 +3454,47 @@ describe("Embedding batching", () => {
     }
   });
 
+  test("generateEmbeddings accepts multiple collections and embeds shared hashes once", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+    const sharedBody = "# Shared\n\nsemantic hybrid content shared across collections";
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      await insertTestDocument(db, "coll-a", {
+        body: sharedBody,
+        displayPath: "shared-a.md",
+      });
+      await insertTestDocument(db, "coll-b", {
+        body: sharedBody,
+        displayPath: "shared-b.md",
+      });
+      await insertTestDocument(db, "coll-c", {
+        body: "# Other\n\nnot selected",
+        displayPath: "other.md",
+      });
+
+      const result = await generateEmbeddings(store, {
+        collection: ["coll-a", "coll-b"],
+      });
+
+      expect(result.docsProcessed).toBe(1);
+      expect(result.chunksEmbedded).toBe(1);
+      expect(fakeLlm.embedBatchCalls).toHaveLength(1);
+      expect(fakeLlm.embedBatchCalls[0]).toHaveLength(1);
+      expect(db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get()).toEqual({ count: 1 });
+      expect(store.getHashesNeedingEmbedding()).toBe(1);
+      expect(getHashesNeedingEmbedding(db, ["coll-a", "coll-b"])).toBe(0);
+      expect(getHashesNeedingEmbedding(db, "coll-c")).toBe(1);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
   test("vectorSearchQuery uses the active llm embed model for vector lookups", async () => {
     const store = await createTestStore();
     const model = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";
@@ -3443,6 +3543,145 @@ describe("Embedding batching", () => {
       expect(searchVecSpy.mock.calls[0]?.[0]).toBe("hybrid query");
       expect(searchVecSpy.mock.calls[0]?.[1]).toBe(model);
       expect(searchVecSpy.mock.calls[0]?.[5]).toEqual([1, 2, 3]);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("hybridQuery passes multi-collection filters into FTS and vector retrieval", async () => {
+    const store = await createTestStore();
+    const model = "hf:test/embed-model.gguf";
+    const embedBatchSpy = vi.fn(async (texts: string[]) => texts.map(() => ({
+      embedding: [1, 2, 3],
+      model,
+    })));
+    const searchVecSpy = vi.fn(async () => [] as SearchResult[]) as any;
+    const searchFtsSpy = vi.fn(() => [] as SearchResult[]) as any;
+
+    store.db.exec(`CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)`);
+    store.llm = {
+      embedModelName: model,
+      embedBatch: embedBatchSpy,
+    } as any;
+    store.searchVec = searchVecSpy as any;
+    store.searchFTS = searchFtsSpy as any;
+    store.expandQuery = vi.fn(async () => []) as any;
+
+    try {
+      await hybridQuery(store, "hybrid query", {
+        collection: ["coll-a", "coll-b"],
+        limit: 5,
+        minScore: 0,
+        skipRerank: true,
+      });
+
+      expect(searchFtsSpy).toHaveBeenCalledWith("hybrid query", 20, ["coll-a", "coll-b"]);
+      expect(searchVecSpy.mock.calls[0]?.[3]).toEqual(["coll-a", "coll-b"]);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("hybridQuery returns useful degraded results when only some docs have vectors", async () => {
+    const store = await createTestStore();
+    const model = "hf:test/embed-model.gguf";
+    const lexicalOnly: SearchResult = {
+      filepath: "qmd://coll-a/lexical.md",
+      displayPath: "coll-a/lexical.md",
+      title: "Lexical",
+      hash: "lexicalhash",
+      docid: "lexica",
+      collectionName: "coll-a",
+      modifiedAt: "",
+      bodyLength: 32,
+      body: "# Lexical\n\npartial embedding fallback",
+      context: null,
+      score: 0.9,
+      source: "fts",
+    };
+    const vectorHit: SearchResult = {
+      filepath: "qmd://coll-a/vector.md",
+      displayPath: "coll-a/vector.md",
+      title: "Vector",
+      hash: "vectorhash",
+      docid: "vector",
+      collectionName: "coll-a",
+      modifiedAt: "",
+      bodyLength: 30,
+      body: "# Vector\n\nsemantic available hit",
+      context: null,
+      score: 0.8,
+      source: "vec",
+      chunkPos: 0,
+    };
+
+    store.db.exec(`CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)`);
+    store.llm = {
+      embedModelName: model,
+      embedBatch: vi.fn(async () => [{ embedding: [1, 2, 3], model }]),
+    } as any;
+    store.searchFTS = vi.fn(() => [lexicalOnly]) as any;
+    store.searchVec = vi.fn(async () => [vectorHit]) as any;
+    store.expandQuery = vi.fn(async () => []) as any;
+
+    try {
+      const results = await hybridQuery(store, "partial embedding fallback", {
+        collection: ["coll-a"],
+        limit: 5,
+        minScore: 0,
+        skipRerank: true,
+      });
+
+      expect(results.map(r => r.file).sort()).toEqual([
+        "qmd://coll-a/lexical.md",
+        "qmd://coll-a/vector.md",
+      ]);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("hybridQuery degrades to lexical results when vector lookup fails", async () => {
+    const store = await createTestStore();
+    const model = "hf:test/embed-model.gguf";
+    const lexicalOnly: SearchResult = {
+      filepath: "qmd://coll-a/lexical.md",
+      displayPath: "coll-a/lexical.md",
+      title: "Lexical",
+      hash: "lexicalhash",
+      docid: "lexica",
+      collectionName: "coll-a",
+      modifiedAt: "",
+      bodyLength: 32,
+      body: "# Lexical\n\nbounded hybrid fallback",
+      context: null,
+      score: 0.9,
+      source: "fts",
+    };
+
+    store.db.exec(`CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)`);
+    store.llm = {
+      embedModelName: model,
+      embedBatch: vi.fn(async () => [{ embedding: [1, 2, 3], model }]),
+    } as any;
+    store.searchFTS = vi.fn(() => [lexicalOnly]) as any;
+    store.searchVec = vi.fn(async () => {
+      throw new Error("database is locked");
+    }) as any;
+    store.expandQuery = vi.fn(async () => []) as any;
+
+    try {
+      const startedAt = Date.now();
+      const results = await hybridQuery(store, "bounded hybrid fallback", {
+        collection: ["coll-a"],
+        limit: 5,
+        minScore: 0,
+        skipRerank: true,
+      });
+
+      expect(Date.now() - startedAt).toBeLessThan(500);
+      expect(results).toHaveLength(1);
+      expect(results[0]?.file).toBe("qmd://coll-a/lexical.md");
     } finally {
       await cleanupTestDb(store);
     }

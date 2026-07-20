@@ -65,7 +65,7 @@ if (isBun) {
 /**
  * Open a SQLite database. Works with both bun:sqlite and better-sqlite3.
  */
-export function openDatabase(path: string, options: { readonly?: boolean } = {}): Database {
+export function openDatabase(path: string, options: { readonly?: boolean; busyTimeoutMs?: number } = {}): Database {
   const constructorOptions = options.readonly
     ? { readonly: true, create: false, fileMustExist: true }
     : undefined;
@@ -73,9 +73,11 @@ export function openDatabase(path: string, options: { readonly?: boolean } = {})
   // QMD is frequently invoked as many short-lived CLI processes. Even search
   // commands run startup/schema checks, so concurrent readers can briefly
   // contend with WAL/schema locks. Wait instead of failing immediately.
-  const raw = process.env.QMD_SQLITE_BUSY_TIMEOUT_MS;
-  const parsed = raw ? Number.parseInt(raw, 10) : 10000;
-  const timeoutMs = Number.isFinite(parsed) && parsed >= 0 ? parsed : 10000;
+  const envName = options.readonly ? "QMD_SQLITE_READ_BUSY_TIMEOUT_MS" : "QMD_SQLITE_BUSY_TIMEOUT_MS";
+  const fallback = options.readonly ? 500 : 10000;
+  const raw = process.env[envName] ?? (options.readonly ? process.env.QMD_SQLITE_BUSY_TIMEOUT_MS : undefined);
+  const parsed = options.busyTimeoutMs ?? (raw ? Number.parseInt(raw, 10) : fallback);
+  const timeoutMs = Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
   try {
     db.exec(`PRAGMA busy_timeout = ${timeoutMs}`);
   } catch {

@@ -14,7 +14,7 @@
 import { openDatabase, loadSqliteVec } from "./db.js";
 import type { Database } from "./db.js";
 import picomatch from "picomatch";
-import { createHash } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import { existsSync, readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
 // Note: node:path resolve is not imported — we export our own cross-platform resolve()
 import fastGlob from "fast-glob";
@@ -41,6 +41,7 @@ import type {
   CollectionConfig,
   ContextMap,
 } from "./collections.js";
+import { withWriterLock, type WriterLockOptions } from "./writer-lock.js";
 
 // =============================================================================
 // Configuration
@@ -53,6 +54,7 @@ export const DEFAULT_GLOB = "**/*.md";
 export const DEFAULT_MULTI_GET_MAX_BYTES = 10 * 1024; // 10KB
 export const DEFAULT_EMBED_MAX_DOCS_PER_BATCH = 64;
 export const DEFAULT_EMBED_MAX_BATCH_BYTES = 64 * 1024 * 1024; // 64MB
+export const DEFAULT_EMBED_CLAIM_TTL_MS = 60 * 60 * 1000;
 
 const EMBED_FINGERPRINT_PROBE_QUERY = "__qmd_embedding_query_probe__";
 const EMBED_FINGERPRINT_PROBE_TITLE = "__qmd_embedding_title_probe__";
@@ -61,6 +63,35 @@ const readonlyDatabases = new WeakSet<Database>();
 
 function isReadOnlyDatabase(db: Database): boolean {
   return readonlyDatabases.has(db);
+}
+
+function normalizeCollectionFilter(collections?: string | string[]): string[] {
+  if (!collections) return [];
+  const raw = Array.isArray(collections) ? collections : [collections];
+  return [...new Set(raw.map(c => c.trim()).filter(Boolean))];
+}
+
+function buildCollectionSql(collections?: string | string[], alias: string = "d"): { sql: string; params: string[] } {
+  const normalized = normalizeCollectionFilter(collections);
+  if (normalized.length === 0) return { sql: "", params: [] };
+  if (normalized.length === 1) {
+    return { sql: ` AND ${alias}.collection = ?`, params: normalized };
+  }
+  return {
+    sql: ` AND ${alias}.collection IN (${normalized.map(() => "?").join(",")})`,
+    params: normalized,
+  };
+}
+
+function parseNonNegativeIntegerEnv(name: string, fallback: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function getEmbedClaimTtlMs(): number {
+  return parseNonNegativeIntegerEnv("QMD_EMBED_CLAIM_TTL_MS", DEFAULT_EMBED_CLAIM_TTL_MS);
 }
 
 // Chunking: 900 tokens per chunk with 15% overlap
@@ -900,6 +931,19 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS embedding_claims (
+      hash TEXT NOT NULL,
+      model TEXT NOT NULL,
+      embed_fingerprint TEXT NOT NULL,
+      owner TEXT NOT NULL,
+      claimed_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      PRIMARY KEY (hash, model, embed_fingerprint)
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_embedding_claims_expires ON embedding_claims(expires_at)`);
+
   // Store collections — makes the DB self-contained (no external config needed)
   db.exec(`
     CREATE TABLE IF NOT EXISTS store_collections (
@@ -1186,6 +1230,7 @@ export type Store = {
   llm?: LlamaCpp;
   close: () => void;
   ensureVecTable: (dimensions: number) => void;
+  withWriteLock: <T>(purpose: string, fn: () => T | Promise<T>, options?: WriterLockOptions) => Promise<T>;
 
   // Index health
   getHashesNeedingEmbedding: (model?: string) => number;
@@ -1249,7 +1294,7 @@ export type Store = {
 
   // Vector/embedding operations
   getHashesForEmbedding: () => { hash: string; body: string; path: string }[];
-  clearAllEmbeddings: () => void;
+  clearAllEmbeddings: (collections?: string | string[]) => void;
   insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, totalChunks?: number, fingerprint?: string) => void;
 };
 
@@ -1307,8 +1352,21 @@ export async function reindexCollection(
   });
 
   const total = files.length;
-  let indexed = 0, updated = 0, unchanged = 0, processed = 0;
+  let processed = 0;
   const seenPaths = new Set<string>();
+  const existingSnapshot = new Map((db.prepare(`
+    SELECT path, hash
+    FROM documents
+    WHERE collection = ? AND active = 1
+  `).all(collectionName) as { path: string; hash: string }[]).map(row => [row.path, row.hash]));
+  const scanned: {
+    path: string;
+    title: string;
+    hash: string;
+    content?: string;
+    createdAt: string;
+    modifiedAt: string;
+  }[] = [];
 
   for (const relativeFile of files) {
     const filepath = getRealPath(resolve(collectionPath, relativeFile));
@@ -1334,50 +1392,85 @@ export async function reindexCollection(
 
     const hash = await hashContent(content);
     const title = extractTitle(content, relativeFile);
-
-    const existing = findOrMigrateLegacyDocument(db, collectionName, path);
-
-    if (existing) {
-      if (existing.hash === hash) {
-        if (existing.title !== title) {
-          updateDocumentTitle(db, existing.id, title, now);
-          updated++;
-        } else {
-          unchanged++;
-        }
-      } else {
-        insertContent(db, hash, content, now);
-        const stat = statSync(filepath);
-        updateDocument(db, existing.id, title, hash,
-          stat ? new Date(stat.mtime).toISOString() : now);
-        updated++;
-      }
-    } else {
-      indexed++;
-      insertContent(db, hash, content, now);
-      const stat = statSync(filepath);
-      insertDocument(db, collectionName, path, title, hash,
-        stat ? new Date(stat.birthtime).toISOString() : now,
-        stat ? new Date(stat.mtime).toISOString() : now);
-    }
+    const stat = statSync(filepath);
+    scanned.push({
+      path,
+      title,
+      hash,
+      content: existingSnapshot.get(path) === hash ? undefined : content,
+      createdAt: stat ? new Date(stat.birthtime).toISOString() : now,
+      modifiedAt: stat ? new Date(stat.mtime).toISOString() : now,
+    });
 
     processed++;
     options?.onProgress?.({ file: relativeFile, current: processed, total });
   }
 
-  // Deactivate documents that no longer exist
-  const allActive = getActiveDocumentPaths(db, collectionName);
-  let removed = 0;
-  for (const path of allActive) {
-    if (!seenPaths.has(path)) {
-      deactivateDocument(db, collectionName, path);
-      removed++;
+  const commit = db.transaction((): ReindexResult => {
+    let indexed = 0, updated = 0, unchanged = 0;
+
+    const materializeDoc = (doc: typeof scanned[number]): typeof scanned[number] | null => {
+      if (doc.content !== undefined) return doc;
+      try {
+        const filepath = getRealPath(resolve(collectionPath, doc.path));
+        const content = readFileSync(filepath, "utf-8");
+        if (!content.trim()) return null;
+        const stat = statSync(filepath);
+        const hash = createHash("sha256").update(content).digest("hex");
+        return {
+          ...doc,
+          title: extractTitle(content, doc.path),
+          hash,
+          content,
+          createdAt: stat ? new Date(stat.birthtime).toISOString() : doc.createdAt,
+          modifiedAt: stat ? new Date(stat.mtime).toISOString() : doc.modifiedAt,
+        };
+      } catch {
+        return null;
+      }
+    };
+
+    for (const doc of scanned) {
+      const existing = findOrMigrateLegacyDocument(db, collectionName, doc.path);
+
+      if (existing) {
+        if (existing.hash === doc.hash) {
+          if (existing.title !== doc.title) {
+            updateDocumentTitle(db, existing.id, doc.title, now);
+            updated++;
+          } else {
+            unchanged++;
+          }
+        } else {
+          const materialized = materializeDoc(doc);
+          if (!materialized) continue;
+          insertContent(db, materialized.hash, materialized.content!, now);
+          updateDocument(db, existing.id, materialized.title, materialized.hash, materialized.modifiedAt);
+          updated++;
+        }
+      } else {
+        const materialized = materializeDoc(doc);
+        if (!materialized) continue;
+        indexed++;
+        insertContent(db, materialized.hash, materialized.content!, now);
+        insertDocument(db, collectionName, materialized.path, materialized.title, materialized.hash, materialized.createdAt, materialized.modifiedAt);
+      }
     }
-  }
 
-  const orphanedCleaned = cleanupOrphanedContent(db);
+    const allActive = getActiveDocumentPaths(db, collectionName);
+    let removed = 0;
+    for (const path of allActive) {
+      if (!seenPaths.has(path)) {
+        deactivateDocument(db, collectionName, path);
+        removed++;
+      }
+    }
 
-  return { indexed, updated, unchanged, removed, orphanedCleaned };
+    const orphanedCleaned = cleanupOrphanedContent(db);
+    return { indexed, updated, unchanged, removed, orphanedCleaned };
+  });
+
+  return await store.withWriteLock(`update:${collectionName}`, () => commit());
 }
 
 export type EmbedFailure = {
@@ -1414,7 +1507,7 @@ export type EmbedOptions = {
    * Restrict embedding to documents in a single collection.
    * When omitted, all pending documents across every collection are embedded.
    */
-  collection?: string;
+  collection?: string | string[];
   maxDocsPerBatch?: number;
   maxBatchBytes?: number;
   chunkStrategy?: ChunkStrategy;
@@ -1442,6 +1535,45 @@ type ChunkItem = {
   bytes: number;
   expectedTotalChunks: number;
 };
+
+type EmbeddingWrite = {
+  chunk: ChunkItem;
+  embedding: Float32Array;
+};
+
+async function commitEmbeddingWrites(
+  store: Store,
+  owner: string,
+  ttlMs: number,
+  writes: EmbeddingWrite[],
+  model: string,
+  embeddedAt: string,
+  fingerprint: string,
+): Promise<void> {
+  if (writes.length === 0) return;
+  await store.withWriteLock("embed:commit", () => {
+    withLazyContentVectorMigration(store.db, () => {
+      const commit = store.db.transaction(() => {
+        store.ensureVecTable(writes[0]!.embedding.length);
+        refreshEmbeddingClaims(store.db, owner, ttlMs);
+        for (const write of writes) {
+          insertEmbeddingUnsafe(
+            store.db,
+            write.chunk.hash,
+            write.chunk.seq,
+            write.chunk.pos,
+            write.embedding,
+            model,
+            embeddedAt,
+            write.chunk.expectedTotalChunks,
+            fingerprint,
+          );
+        }
+      });
+      commit();
+    });
+  });
+}
 
 function validatePositiveIntegerOption(name: string, value: number | undefined, fallback: number): number {
   if (value === undefined) return fallback;
@@ -1506,8 +1638,59 @@ function withLazyContentVectorMigration<T>(db: Database, operation: () => T): T 
   }
 }
 
-function getPendingEmbeddingDocs(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): PendingEmbeddingDoc[] {
-  const collectionFilter = collection ? `AND d.collection = ?` : ``;
+function cleanupExpiredEmbeddingClaims(db: Database, nowMs: number = Date.now()): number {
+  const result = db.prepare(`DELETE FROM embedding_claims WHERE expires_at <= ?`).run(nowMs);
+  return result.changes;
+}
+
+function releaseEmbeddingClaims(db: Database, owner: string): number {
+  const result = db.prepare(`DELETE FROM embedding_claims WHERE owner = ?`).run(owner);
+  return result.changes;
+}
+
+function refreshEmbeddingClaims(db: Database, owner: string, ttlMs: number, nowMs: number = Date.now()): void {
+  db.prepare(`UPDATE embedding_claims SET expires_at = ? WHERE owner = ?`).run(nowMs + ttlMs, owner);
+}
+
+function claimPendingEmbeddingDocs(
+  db: Database,
+  owner: string,
+  collection: string | string[] | undefined,
+  model: string,
+  ttlMs: number,
+): PendingEmbeddingDoc[] {
+  const nowMs = Date.now();
+  cleanupExpiredEmbeddingClaims(db, nowMs);
+  const docs = getPendingEmbeddingDocs(db, collection, model, nowMs);
+  if (docs.length === 0) return [];
+
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO embedding_claims (hash, model, embed_fingerprint, owner, claimed_at, expires_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  const fingerprint = getEmbeddingFingerprint(model);
+  const expiresAt = nowMs + ttlMs;
+  for (const doc of docs) {
+    insert.run(doc.hash, model, fingerprint, owner, nowMs, expiresAt);
+  }
+
+  const placeholders = docs.map(() => "?").join(",");
+  const claimed = db.prepare(`
+    SELECT hash
+    FROM embedding_claims
+    WHERE owner = ? AND model = ? AND embed_fingerprint = ? AND hash IN (${placeholders})
+  `).all(owner, model, fingerprint, ...docs.map(doc => doc.hash)) as { hash: string }[];
+  const claimedHashes = new Set(claimed.map(row => row.hash));
+  return docs.filter(doc => claimedHashes.has(doc.hash));
+}
+
+function getPendingEmbeddingDocs(
+  db: Database,
+  collection?: string | string[],
+  model: string = DEFAULT_EMBED_MODEL,
+  claimNowMs?: number,
+): PendingEmbeddingDoc[] {
+  const collectionFilter = buildCollectionSql(collection, "d");
   const fingerprint = getEmbeddingFingerprint(model);
   return withLazyContentVectorMigration(db, () => {
     const stmt = db.prepare(`
@@ -1520,13 +1703,26 @@ function getPendingEmbeddingDocs(db: Database, collection?: string, model: strin
         WHERE model = ? AND embed_fingerprint = ?
         GROUP BY hash, model, embed_fingerprint
       ) v ON d.hash = v.hash
+      ${claimNowMs === undefined ? "" : `
+      LEFT JOIN embedding_claims ec
+        ON ec.hash = d.hash
+       AND ec.model = ?
+       AND ec.embed_fingerprint = ?
+       AND ec.expires_at > ?
+      `}
       WHERE d.active = 1
         AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
-        ${collectionFilter}
+        ${claimNowMs === undefined ? "" : "AND ec.hash IS NULL"}
+        ${collectionFilter.sql}
       GROUP BY d.hash
       ORDER BY MIN(d.path)
     `);
-    return (collection ? stmt.all(model, fingerprint, collection) : stmt.all(model, fingerprint)) as PendingEmbeddingDoc[];
+    const params: (string | number)[] = [model, fingerprint];
+    if (claimNowMs !== undefined) {
+      params.push(model, fingerprint, claimNowMs);
+    }
+    params.push(...collectionFilter.params);
+    return stmt.all(...params) as PendingEmbeddingDoc[];
   });
 }
 
@@ -1594,12 +1790,19 @@ export async function generateEmbeddings(
   const now = new Date().toISOString();
   const { maxDocsPerBatch, maxBatchBytes } = resolveEmbedOptions(options);
   const encoder = new TextEncoder();
+  const claimOwner = `${process.pid}:${randomUUID()}`;
+  const claimTtlMs = getEmbedClaimTtlMs();
 
   if (options?.force) {
-    clearAllEmbeddings(db, options?.collection);
+    await store.withWriteLock("embed:force-clear", () => {
+      clearAllEmbeddings(db, options?.collection);
+      cleanupExpiredEmbeddingClaims(db);
+    });
   }
 
-  const docsToEmbed = getPendingEmbeddingDocs(db, options?.collection, model);
+  const docsToEmbed = await store.withWriteLock("embed:claim", () =>
+    claimPendingEmbeddingDocs(db, claimOwner, options?.collection, model, claimTtlMs)
+  );
 
   if (docsToEmbed.length === 0) {
     return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 };
@@ -1618,11 +1821,12 @@ export async function generateEmbeddings(
     return withLLMSessionForLlm(llm, (session) => fn(session, model), sessionOptions);
   };
 
-  const result = await runEmbeddingSession(async (session, embedModelUri) => {
+  let result: { chunksEmbedded: number; errors: number; failures: EmbedFailure[] | undefined };
+  try {
+    result = await runEmbeddingSession(async (session, embedModelUri) => {
     let chunksEmbedded = 0;
     let bytesProcessed = 0;
     let totalChunks = 0;
-    let vectorTableInitialized = false;
     const BATCH_SIZE = 32;
     const RETRY_AFTER_SUCCESSFUL_CHUNKS = 64;
     const MAX_RETRY_ATTEMPTS = 3;
@@ -1662,7 +1866,10 @@ export async function generateEmbeddings(
           recordFailure(chunk, "embedding returned no vector");
           return false;
         }
-        insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now, chunk.expectedTotalChunks, fingerprint);
+        await commitEmbeddingWrites(store, claimOwner, claimTtlMs, [{
+          chunk,
+          embedding: new Float32Array(result.embedding),
+        }], model, now, fingerprint);
         chunksEmbedded++;
         successesSinceRetry++;
         clearFailure(chunk);
@@ -1744,17 +1951,6 @@ export async function generateEmbeddings(
         continue;
       }
 
-      if (!vectorTableInitialized) {
-        const firstChunk = batchChunks[0]!;
-        const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title, embedModelUri);
-        const firstResult = await session.embed(firstText, { model });
-        if (!firstResult) {
-          throw new Error("Failed to get embedding dimensions from first chunk");
-        }
-        store.ensureVecTable(firstResult.embedding.length);
-        vectorTableInitialized = true;
-      }
-
       const totalBatchChunkBytes = batchChunks.reduce((sum, chunk) => sum + chunk.bytes, 0);
       let batchChunkBytesProcessed = 0;
 
@@ -1781,18 +1977,22 @@ export async function generateEmbeddings(
 
         try {
           const embeddings = await session.embedBatch(texts, { model });
+          const writes: EmbeddingWrite[] = [];
           for (let i = 0; i < chunkBatch.length; i++) {
             const chunk = chunkBatch[i]!;
             const embedding = embeddings[i];
             if (embedding) {
-              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now, chunk.expectedTotalChunks, fingerprint);
-              chunksEmbedded++;
-              successesSinceRetry++;
-              clearFailure(chunk);
+              writes.push({ chunk, embedding: new Float32Array(embedding.embedding) });
             } else {
               recordFailure(chunk, "batch embedding returned no vector");
             }
             batchChunkBytesProcessed += chunk.bytes;
+          }
+          await commitEmbeddingWrites(store, claimOwner, claimTtlMs, writes, model, now, fingerprint);
+          for (const write of writes) {
+            chunksEmbedded++;
+            successesSinceRetry++;
+            clearFailure(write.chunk);
           }
           await retryFailedChunks();
         } catch (error) {
@@ -1827,7 +2027,13 @@ export async function generateEmbeddings(
 
       await retryFailedChunks(true);
 
-      const removedPartialChunks = removeIncompleteEmbeddings(db, expectedChunksByHash, model);
+      const removedPartialChunks = await store.withWriteLock("embed:cleanup-partial", () => {
+        const cleanup = db.transaction(() => {
+          refreshEmbeddingClaims(db, claimOwner, claimTtlMs);
+          return removeIncompleteEmbeddings(db, expectedChunksByHash, model);
+        });
+        return cleanup();
+      });
       if (removedPartialChunks > 0) {
         chunksEmbedded = Math.max(0, chunksEmbedded - removedPartialChunks);
       }
@@ -1837,7 +2043,15 @@ export async function generateEmbeddings(
     }
 
     return { chunksEmbedded, errors: activeErrorCount(), failures: failureList() };
-  }, { maxDuration: Number(process.env.QMD_EMBED_MAX_DURATION_MS ?? 30 * 60 * 1000), name: 'generateEmbeddings', storeLlm: store.llm ?? undefined });
+    }, { maxDuration: Number(process.env.QMD_EMBED_MAX_DURATION_MS ?? 30 * 60 * 1000), name: 'generateEmbeddings', storeLlm: store.llm ?? undefined });
+  } finally {
+    await store.withWriteLock("embed:release-claims", () => {
+      releaseEmbeddingClaims(db, claimOwner);
+      cleanupExpiredEmbeddingClaims(db);
+    }).catch((error) => {
+      console.warn(`⚠ Failed to release embedding claims: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }
 
   return {
     docsProcessed: totalDocs,
@@ -1901,6 +2115,8 @@ export function createStore(dbPath?: string, options: CreateStoreOptions = {}): 
     dbPath: resolvedPath,
     close: () => db.close(),
     ensureVecTable: (dimensions: number) => ensureVecTableInternal(db, dimensions),
+    withWriteLock: <T>(purpose: string, fn: () => T | Promise<T>, lockOptions?: WriterLockOptions) =>
+      withWriterLock(resolvedPath, purpose, fn, lockOptions),
 
     // Index health
     getHashesNeedingEmbedding: (model?: string) => getHashesNeedingEmbedding(db, undefined, model ?? store.llm?.embedModelName ?? DEFAULT_EMBED_MODEL),
@@ -1964,7 +2180,7 @@ export function createStore(dbPath?: string, options: CreateStoreOptions = {}): 
 
     // Vector/embedding operations
     getHashesForEmbedding: () => getHashesForEmbedding(db),
-    clearAllEmbeddings: () => clearAllEmbeddings(db),
+    clearAllEmbeddings: (collections?: string | string[]) => clearAllEmbeddings(db, collections),
     insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, totalChunks?: number, fingerprint?: string) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt, totalChunks, fingerprint),
   };
 
@@ -2164,8 +2380,8 @@ export type IndexStatus = {
 // Index health
 // =============================================================================
 
-export function getHashesNeedingEmbedding(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): number {
-  const collectionFilter = collection ? `AND d.collection = ?` : ``;
+export function getHashesNeedingEmbedding(db: Database, collection?: string | string[], model: string = DEFAULT_EMBED_MODEL): number {
+  const collectionFilter = buildCollectionSql(collection, "d");
   const fingerprint = getEmbeddingFingerprint(model);
   return withLazyContentVectorMigration(db, () => {
     const stmt = db.prepare(`
@@ -2179,9 +2395,9 @@ export function getHashesNeedingEmbedding(db: Database, collection?: string, mod
       ) v ON d.hash = v.hash
       WHERE d.active = 1
         AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
-        ${collectionFilter}
+        ${collectionFilter.sql}
     `);
-    const result = (collection ? stmt.get(model, fingerprint, collection) : stmt.get(model, fingerprint)) as { count: number };
+    const result = stmt.get(model, fingerprint, ...collectionFilter.params) as { count: number };
     return result.count;
   });
 }
@@ -3639,17 +3855,9 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
     WHERE d.active = 1
   `;
 
-  if (collections) {
-    const collArray = Array.isArray(collections) ? collections : [collections];
-    if (collArray.length === 1 && collArray[0]) {
-      sql += ` AND d.collection = ?`;
-      params.push(collArray[0]);
-    } else if (collArray.length > 1) {
-      const valid = collArray.filter(Boolean);
-      sql += ` AND d.collection IN (${valid.map(() => '?').join(',')})`;
-      params.push(...valid);
-    }
-  }
+  const collectionFilter = buildCollectionSql(collections, "d");
+  sql += collectionFilter.sql;
+  params.push(...collectionFilter.params);
 
   // bm25 lower is better; sort ascending.
   sql += ` ORDER BY fm.bm25_score ASC LIMIT ?`;
@@ -3697,11 +3905,15 @@ export async function searchVec(db: Database, query: string, model: string, limi
   // See: https://github.com/tobi/qmd/pull/23
 
   // Step 1: Get vector matches from sqlite-vec (no JOINs allowed)
+  const collectionCount = normalizeCollectionFilter(collections).length;
+  const vecCandidateLimit = collectionCount > 0
+    ? Math.max(limit * 100, 1000)
+    : limit * 3;
   const vecResults = db.prepare(`
     SELECT hash_seq, distance
     FROM vectors_vec
     WHERE embedding MATCH ? AND k = ?
-  `).all(new Float32Array(embedding), limit * 3) as { hash_seq: string; distance: number }[];
+  `).all(new Float32Array(embedding), vecCandidateLimit) as { hash_seq: string; distance: number }[];
 
   if (vecResults.length === 0) return [];
 
@@ -3727,17 +3939,9 @@ export async function searchVec(db: Database, query: string, model: string, limi
   `;
   const params: string[] = [...hashSeqs];
 
-  if (collections) {
-    const collArray = Array.isArray(collections) ? collections : [collections];
-    if (collArray.length === 1 && collArray[0]) {
-      docSql += ` AND d.collection = ?`;
-      params.push(collArray[0]);
-    } else if (collArray.length > 1) {
-      const valid = collArray.filter(Boolean);
-      docSql += ` AND d.collection IN (${valid.map(() => '?').join(',')})`;
-      params.push(...valid);
-    }
-  }
+  const docCollectionFilter = buildCollectionSql(collections, "d");
+  docSql += docCollectionFilter.sql;
+  params.push(...docCollectionFilter.params);
 
   const docRows = withLazyContentVectorMigration(db, () => db.prepare(docSql).all(...params) as {
     hash_seq: string; hash: string; pos: number; filepath: string;
@@ -3837,24 +4041,28 @@ export function getHashesForEmbedding(db: Database, model: string = DEFAULT_EMBE
  * clear empties content_vectors entirely, in which case it is dropped so the
  * next embed can recreate the table with the current dimensions.
  */
-export function clearAllEmbeddings(db: Database, collection?: string): void {
-  if (!collection) {
+export function clearAllEmbeddings(db: Database, collection?: string | string[]): void {
+  const collections = normalizeCollectionFilter(collection);
+  if (collections.length === 0) {
     db.exec(`DELETE FROM content_vectors`);
+    db.exec(`DELETE FROM embedding_claims`);
     db.exec(`DROP TABLE IF EXISTS vectors_vec`);
     return;
   }
 
+  const placeholders = collections.map(() => "?").join(",");
   const exclusiveHashesQuery = `
     SELECT DISTINCT d.hash
     FROM documents d
-    WHERE d.collection = ? AND d.active = 1
+    WHERE d.collection IN (${placeholders}) AND d.active = 1
       AND NOT EXISTS (
         SELECT 1 FROM documents d2
         WHERE d2.hash = d.hash
           AND d2.active = 1
-          AND d2.collection != d.collection
+          AND d2.collection NOT IN (${placeholders})
       )
   `;
+  const exclusiveHashParams = [...collections, ...collections];
 
   const vecTableExists = db
     .prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='vectors_vec'`)
@@ -3866,7 +4074,7 @@ export function clearAllEmbeddings(db: Database, collection?: string): void {
         SELECT cv.hash, cv.seq
         FROM content_vectors cv
         WHERE cv.hash IN (${exclusiveHashesQuery})
-      `).all(collection) as { hash: string; seq: number }[];
+      `).all(...exclusiveHashParams) as { hash: string; seq: number }[];
 
       const delVec = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
       for (const row of hashSeqRows) {
@@ -3877,7 +4085,12 @@ export function clearAllEmbeddings(db: Database, collection?: string): void {
     db.prepare(`
       DELETE FROM content_vectors
       WHERE hash IN (${exclusiveHashesQuery})
-    `).run(collection);
+    `).run(...exclusiveHashParams);
+
+    db.prepare(`
+      DELETE FROM embedding_claims
+      WHERE hash IN (${exclusiveHashesQuery})
+    `).run(...exclusiveHashParams);
 
     const remaining = db
       .prepare(`SELECT COUNT(*) AS n FROM content_vectors`)
@@ -3909,34 +4122,49 @@ export function insertEmbedding(
   totalChunks: number = 1,
   fingerprint: string = getEmbeddingFingerprint(model)
 ): void {
-  const hashSeq = `${hash}_${seq}`;
-
   withLazyContentVectorMigration(db, () => {
-    // Insert content_vectors first — crash-safe ordering (see getHashesForEmbedding)
-    const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embed_fingerprint, total_chunks, embedded_at) VALUES (?, ?, ?, ?, ?, ?, ?)`);
-    insertContentVectorStmt.run(hash, seq, pos, model, fingerprint, totalChunks, embeddedAt);
-
-    // vec0 virtual tables don't support OR REPLACE — use DELETE + INSERT
-    const deleteVecStmt = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
-    const insertVecStmt = db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
-    deleteVecStmt.run(hashSeq);
-    insertVecStmt.run(hashSeq, embedding);
+    const write = db.transaction(() => {
+      insertEmbeddingUnsafe(db, hash, seq, pos, embedding, model, embeddedAt, totalChunks, fingerprint);
+    });
+    write();
   });
+}
+
+function insertEmbeddingUnsafe(
+  db: Database,
+  hash: string,
+  seq: number,
+  pos: number,
+  embedding: Float32Array,
+  model: string,
+  embeddedAt: string,
+  totalChunks: number,
+  fingerprint: string,
+): void {
+  const hashSeq = `${hash}_${seq}`;
+  const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embed_fingerprint, total_chunks, embedded_at) VALUES (?, ?, ?, ?, ?, ?, ?)`);
+  insertContentVectorStmt.run(hash, seq, pos, model, fingerprint, totalChunks, embeddedAt);
+
+  const deleteVecStmt = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
+  const insertVecStmt = db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
+  deleteVecStmt.run(hashSeq);
+  insertVecStmt.run(hashSeq, embedding);
 }
 
 function removeIncompleteEmbeddings(db: Database, expectedChunksByHash: Map<string, number>, model: string): number {
   return withLazyContentVectorMigration(db, () => {
     let removed = 0;
+    const hasVecTable = !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
     const rowsStmt = db.prepare(`SELECT seq FROM content_vectors WHERE hash = ? AND model = ?`);
     const deleteContentStmt = db.prepare(`DELETE FROM content_vectors WHERE hash = ? AND model = ?`);
-    const deleteVecStmt = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
+    const deleteVecStmt = hasVecTable ? db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`) : null;
 
     for (const [hash, expectedChunks] of expectedChunksByHash) {
       const rows = rowsStmt.all(hash, model) as { seq: number }[];
       if (rows.length === 0 || rows.length === expectedChunks) continue;
 
       for (const row of rows) {
-        deleteVecStmt.run(`${hash}_${row.seq}`);
+        deleteVecStmt?.run(`${hash}_${row.seq}`);
       }
       deleteContentStmt.run(hash, model);
       removed += rows.length;
@@ -4694,7 +4922,7 @@ export interface SearchHooks {
 }
 
 export interface HybridQueryOptions {
-  collection?: string;
+  collection?: string | string[];
   limit?: number;           // default 10
   minScore?: number;        // default 0
   candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
@@ -4769,9 +4997,14 @@ export async function hybridQuery(
   const rankedLists: RankedResult[][] = [];
   const rankedListMeta: RankedListMeta[] = [];
   const docidMap = new Map<string, string>(); // filepath -> docid
-  const hasVectors = !!store.db.prepare(
-    `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
-  ).get();
+  let hasVectors = false;
+  try {
+    hasVectors = !!store.db.prepare(
+      `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
+    ).get();
+  } catch {
+    hasVectors = false;
+  }
 
   // Step 1: BM25 probe — strong signal skips expensive LLM expansion
   // When intent is provided, disable strong-signal bypass — the obvious BM25
@@ -4844,30 +5077,39 @@ export async function hybridQuery(
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, embedModel));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
-    const embeddings = await llm.embedBatch(textsToEmbed);
-    hooks?.onEmbedDone?.(Date.now() - embedStart);
+    try {
+      const embeddings = await llm.embedBatch(textsToEmbed);
+      hooks?.onEmbedDone?.(Date.now() - embedStart);
 
-    // Run sqlite-vec lookups with pre-computed embeddings
-    for (let i = 0; i < vecQueries.length; i++) {
-      const embedding = embeddings[i]?.embedding;
-      if (!embedding) continue;
+      // Run sqlite-vec lookups with pre-computed embeddings
+      for (let i = 0; i < vecQueries.length; i++) {
+        const embedding = embeddings[i]?.embedding;
+        if (!embedding) continue;
 
-      const vecResults = await store.searchVec(
-        vecQueries[i]!.text, embedModel, 20, collection,
-        undefined, embedding
-      );
-      if (vecResults.length > 0) {
-        for (const r of vecResults) docidMap.set(r.filepath, r.docid);
-        rankedLists.push(vecResults.map(r => ({
-          file: r.filepath, displayPath: r.displayPath,
-          title: r.title, body: r.body || "", score: r.score,
-        })));
-        rankedListMeta.push({
-          source: "vec",
-          queryType: vecQueries[i]!.queryType,
-          query: vecQueries[i]!.text,
-        });
+        let vecResults: SearchResult[] = [];
+        try {
+          vecResults = await store.searchVec(
+            vecQueries[i]!.text, embedModel, 20, collection,
+            undefined, embedding
+          );
+        } catch {
+          vecResults = [];
+        }
+        if (vecResults.length > 0) {
+          for (const r of vecResults) docidMap.set(r.filepath, r.docid);
+          rankedLists.push(vecResults.map(r => ({
+            file: r.filepath, displayPath: r.displayPath,
+            title: r.title, body: r.body || "", score: r.score,
+          })));
+          rankedListMeta.push({
+            source: "vec",
+            queryType: vecQueries[i]!.queryType,
+            query: vecQueries[i]!.text,
+          });
+        }
       }
+    } catch {
+      hooks?.onEmbedDone?.(Date.now() - embedStart);
     }
   }
 
@@ -5036,7 +5278,7 @@ export async function hybridQuery(
 }
 
 export interface VectorSearchOptions {
-  collection?: string;
+  collection?: string | string[];
   limit?: number;           // default 10
   minScore?: number;        // default 0.3
   intent?: string;          // domain intent hint for disambiguation
@@ -5072,9 +5314,14 @@ export async function vectorSearchQuery(
   const collection = options?.collection;
   const intent = options?.intent;
 
-  const hasVectors = !!store.db.prepare(
-    `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
-  ).get();
+  let hasVectors = false;
+  try {
+    hasVectors = !!store.db.prepare(
+      `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
+    ).get();
+  } catch {
+    hasVectors = false;
+  }
   if (!hasVectors) return [];
 
   // Expand query — filter to vec/hyde only (lex queries target FTS, not vector)
@@ -5088,7 +5335,12 @@ export async function vectorSearchQuery(
   const queryTexts = [query, ...vecExpanded.map(q => q.query)];
   const allResults = new Map<string, VectorSearchResult>();
   for (const q of queryTexts) {
-    const vecResults = await store.searchVec(q, embedModel, limit, collection);
+    let vecResults: SearchResult[] = [];
+    try {
+      vecResults = await store.searchVec(q, embedModel, limit, collection);
+    } catch {
+      vecResults = [];
+    }
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
       if (!existing || r.score > existing.score) {
@@ -5190,9 +5442,14 @@ export async function structuredSearch(
   const rankedLists: RankedResult[][] = [];
   const rankedListMeta: RankedListMeta[] = [];
   const docidMap = new Map<string, string>(); // filepath -> docid
-  const hasVectors = !!store.db.prepare(
-    `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
-  ).get();
+  let hasVectors = false;
+  try {
+    hasVectors = !!store.db.prepare(
+      `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
+    ).get();
+  } catch {
+    hasVectors = false;
+  }
 
   // Helper to run search across collections (or all if undefined)
   const collectionList = collections ?? [undefined]; // undefined = all collections
@@ -5230,31 +5487,40 @@ export async function structuredSearch(
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, modelName));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
-      const embeddings = await llm.embedBatch(textsToEmbed);
-      hooks?.onEmbedDone?.(Date.now() - embedStart);
+      try {
+        const embeddings = await llm.embedBatch(textsToEmbed);
+        hooks?.onEmbedDone?.(Date.now() - embedStart);
 
-      for (let i = 0; i < vecSearches.length; i++) {
-        const embedding = embeddings[i]?.embedding;
-        if (!embedding) continue;
+        for (let i = 0; i < vecSearches.length; i++) {
+          const embedding = embeddings[i]?.embedding;
+          if (!embedding) continue;
 
-        for (const coll of collectionList) {
-          const vecResults = await store.searchVec(
-            vecSearches[i]!.query, modelName, 20, coll,
-            undefined, embedding
-          );
-          if (vecResults.length > 0) {
-            for (const r of vecResults) docidMap.set(r.filepath, r.docid);
-            rankedLists.push(vecResults.map(r => ({
-              file: r.filepath, displayPath: r.displayPath,
-              title: r.title, body: r.body || "", score: r.score,
-            })));
-            rankedListMeta.push({
-              source: "vec",
-              queryType: vecSearches[i]!.type,
-              query: vecSearches[i]!.query,
-            });
+          for (const coll of collectionList) {
+            let vecResults: SearchResult[] = [];
+            try {
+              vecResults = await store.searchVec(
+                vecSearches[i]!.query, modelName, 20, coll,
+                undefined, embedding
+              );
+            } catch {
+              vecResults = [];
+            }
+            if (vecResults.length > 0) {
+              for (const r of vecResults) docidMap.set(r.filepath, r.docid);
+              rankedLists.push(vecResults.map(r => ({
+                file: r.filepath, displayPath: r.displayPath,
+                title: r.title, body: r.body || "", score: r.score,
+              })));
+              rankedListMeta.push({
+                source: "vec",
+                queryType: vecSearches[i]!.type,
+                query: vecSearches[i]!.query,
+              });
+            }
           }
         }
+      } catch {
+        hooks?.onEmbedDone?.(Date.now() - embedStart);
       }
     }
   }

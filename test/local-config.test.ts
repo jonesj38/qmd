@@ -71,11 +71,24 @@ describe("local .qmd project config", () => {
 
     const home = join(root, "home");
     const { bin, args } = cliCommandArgs("status");
+    const env = { ...process.env };
+    for (const key of [
+      "OPENAI_API_KEY",
+      "QMD_OPENAI",
+      "QMD_OPENAI_API_KEY",
+      "QMD_OPENAI_BASE_URL",
+      "QMD_OPENAI_CHAT_API_KEY",
+      "QMD_OPENAI_CHAT_BASE_URL",
+      "QMD_OPENAI_RERANK_API_KEY",
+      "QMD_OPENAI_RERANK_BASE_URL",
+    ]) {
+      delete env[key];
+    }
     const output = execFileSync(bin, args, {
       cwd: root,
       encoding: "utf-8",
       env: {
-        ...process.env,
+        ...env,
         HOME: home,
         XDG_CONFIG_HOME: join(home, ".config"),
         XDG_CACHE_HOME: join(home, ".cache"),

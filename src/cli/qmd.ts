@@ -733,14 +733,17 @@ async function updateCollections(collectionOption?: string | string[]): Promise<
   const storeInstance = getStore();
   // Collections are defined in YAML; no duplicate cleanup needed.
 
-  // Clear Ollama cache on update
-  clearCache(db);
-
   const collectionFilter = resolveCollectionFilter(collectionOption, false);
   const allCollections = listCollections(db);
   const collections = collectionFilter.length > 0
     ? allCollections.filter((collection) => collectionFilter.includes(collection.name))
     : allCollections;
+  const selectedNames = new Set(collections.map(collection => collection.name));
+  const omitted = collectionFilter.filter(name => !selectedNames.has(name));
+  if (omitted.length > 0) {
+    closeDb();
+    throw new Error(`Requested collection(s) not available in the index after config sync: ${omitted.join(", ")}`);
+  }
 
   if (collections.length === 0) {
     console.log(`${c.dim}No collections found. Run 'qmd collection add .' to index markdown files.${c.reset}`);
@@ -749,6 +752,7 @@ async function updateCollections(collectionOption?: string | string[]): Promise<
   }
 
   console.log(`${c.bold}Updating ${collections.length} collection(s)...${c.reset}\n`);
+  await storeInstance.withWriteLock("update:clear-cache", () => clearCache(db));
 
   for (let i = 0; i < collections.length; i++) {
     const col = collections[i];
@@ -2058,13 +2062,19 @@ function resolveModelsForCli(): { embed: string; generate: string; rerank: strin
 async function vectorIndex(
   model: string = resolveEmbedModelForCli(),
   force: boolean = false,
-  batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy; collection?: string },
+  batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy; collection?: string | string[] },
 ): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
+  const collections = Array.isArray(batchOptions?.collection)
+    ? batchOptions.collection
+    : batchOptions?.collection
+      ? [batchOptions.collection]
+      : [];
 
   if (force) {
-    console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
+    const scope = collections.length > 0 ? ` for ${collections.join(", ")}` : "";
+    console.log(`${c.yellow}Force re-indexing: clearing vectors${scope}...${c.reset}`);
   }
 
   // Check if there's work to do before starting
@@ -2076,6 +2086,13 @@ async function vectorIndex(
   }
 
   console.log(`${c.dim}Model: ${shortModelName(model)}${c.reset}\n`);
+  const beforeByCollection = collections.map(name => ({
+    name,
+    pending: getHashesNeedingEmbedding(db, name, model),
+  }));
+  if (beforeByCollection.length > 0) {
+    console.log(`${c.dim}Collections: ${beforeByCollection.map(row => `${row.name} (${formatCount(row.pending)} pending)`).join(", ")}${c.reset}\n`);
+  }
   if (batchOptions?.maxDocsPerBatch !== undefined || batchOptions?.maxBatchBytes !== undefined) {
     const maxDocsPerBatch = batchOptions.maxDocsPerBatch ?? DEFAULT_EMBED_MAX_DOCS_PER_BATCH;
     const maxBatchBytes = batchOptions.maxBatchBytes ?? DEFAULT_EMBED_MAX_BATCH_BYTES;
@@ -2136,6 +2153,14 @@ async function vectorIndex(
       if ((result.failures?.length ?? 0) > 8) {
         console.log(`  ${c.dim}...and ${formatCount((result.failures?.length ?? 0) - 8)} more${c.reset}`);
       }
+    }
+  }
+
+  if (beforeByCollection.length > 0) {
+    console.log("");
+    for (const row of beforeByCollection) {
+      const after = getHashesNeedingEmbedding(db, row.name, model);
+      console.log(`${row.name}: ${formatCount(row.pending)} -> ${formatCount(after)} pending hashes`);
     }
   }
 
@@ -2668,7 +2693,6 @@ function search(query: string, opts: OutputOptions): void {
   // Validate collection filter (supports multiple -c flags)
   // Use default collections if none specified
   const collectionNames = resolveCollectionFilter(opts.collection, true);
-  const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
 
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
@@ -2717,13 +2741,13 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
   // Validate collection filter (supports multiple -c flags)
   // Use default collections if none specified
   const collectionNames = resolveCollectionFilter(opts.collection, true);
-  const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
+  const collectionFilter = collectionNames.length > 0 ? collectionNames : undefined;
 
   checkIndexHealth(store.db);
 
   const llmSession = async () => {
     let results = await vectorSearchQuery(store, query, {
-      collection: singleCollection,
+      collection: collectionFilter,
       limit: opts.all ? 500 : (opts.limit || 10),
       minScore: opts.minScore || 0.3,
       intent: opts.intent,
@@ -2776,7 +2800,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
   // Validate collection filter (supports multiple -c flags)
   // Use default collections if none specified
   const collectionNames = resolveCollectionFilter(opts.collection, true);
-  const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
+  const collectionFilter = collectionNames.length > 0 ? collectionNames : undefined;
 
   checkIndexHealth(store.db);
 
@@ -2806,7 +2830,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       process.stderr.write(`${c.dim}└─ Searching...${c.reset}\n`);
 
       results = await structuredSearch(store, structuredQueries, {
-        collections: singleCollection ? [singleCollection] : undefined,
+        collections: collectionFilter,
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
@@ -2834,7 +2858,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
     } else {
       // Standard hybrid query with automatic expansion
       results = await hybridQuery(store, query, {
-        collection: singleCollection,
+        collection: collectionFilter,
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
@@ -3488,8 +3512,8 @@ function showHelp(): void {
   console.log("Maintenance:");
   console.log("  qmd init                      - Create a project-local .qmd index");
   console.log("  qmd status                    - View index + collection health");
-  console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
-  console.log("  qmd embed [-f] [-c <name>]    - Generate/refresh vector embeddings");
+  console.log("  qmd update [--pull] [-c <name>...] - Re-index collections (optionally git pull first)");
+  console.log("  qmd embed [-f] [-c <name>...]      - Generate/refresh vector embeddings");
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
   console.log("  qmd cleanup                   - Clear caches, vacuum DB");
@@ -3539,6 +3563,8 @@ function showHelp(): void {
   console.log("Global options:");
   console.log("  --index <name>             - Use a named index (default: index)");
   console.log("  QMD_EDITOR_URI             - Editor link template for clickable TTY search output");
+  console.log("  QMD_WRITER_LOCK_WAIT_MS    - Max maintenance writer-lock wait (default 5000)");
+  console.log("  QMD_SQLITE_READ_BUSY_TIMEOUT_MS - Read-only query busy timeout (default 500)");
   console.log("");
   console.log("Search options:");
   console.log("  -n <num>                   - Max results (default 5, or 20 for --format files|json)");
@@ -4224,7 +4250,13 @@ if (isMain) {
   // Load embedding configuration.
   // Priority: YAML config > env vars > default (local).
   // Setting QMD_OPENAI_BASE_URL alone is enough to activate OpenAI mode.
-  const embeddingYamlConfig = getEmbeddingConfigFromYaml();
+  let embeddingYamlConfig;
+  try {
+    embeddingYamlConfig = getEmbeddingConfigFromYaml();
+  } catch (error) {
+    if (cli.command !== "doctor") throw error;
+    embeddingYamlConfig = { provider: "local" as const };
+  }
   const useOpenAI = embeddingYamlConfig.provider === 'openai'
     || !!process.env.QMD_OPENAI_BASE_URL
     || process.env.QMD_OPENAI === '1';
@@ -4515,7 +4547,11 @@ if (isMain) {
       break;
 
     case "update":
-      await updateCollections(cli.opts.collection);
+      try {
+        await updateCollections(cli.opts.collection);
+      } catch (error) {
+        exitWithError(error);
+      }
       break;
 
     case "embed":
@@ -4526,14 +4562,12 @@ if (isMain) {
         // Validate -c against configured collections before dispatching, so a
         // typo errors with "Collection not found: X" instead of silently
         // reporting success because no pending docs match a nonexistent name.
-        // embed operates on a single collection; only the first value is used.
         const embedValidatedCollections = resolveCollectionFilter(cli.opts.collection, false);
-        const embedCollection = embedValidatedCollections[0];
         await vectorIndex(resolveEmbedModelForCli(), !!cli.values.force, {
           maxDocsPerBatch,
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
           chunkStrategy: embedChunkStrategy,
-          collection: embedCollection,
+          collection: embedValidatedCollections.length > 0 ? embedValidatedCollections : undefined,
         });
       } catch (error) {
         exitWithError(error);

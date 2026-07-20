@@ -49,10 +49,25 @@ qmd multi-get "journals/2025-05*.md"
 
 # Search within a specific collection
 qmd search "API" -c notes
+qmd update -c notes -c docs   # Re-index only selected collections
+qmd embed -c notes -c docs    # Embed selected collections as one deduplicated set
 
 # Export all matches for an agent
 qmd search "API" --all --files --min-score 0.3
 ```
+
+### Maintenance Concurrency
+
+`qmd update` and `qmd embed` coordinate SQLite writes with an atomic SQLite lease sidecar beside the active index (`<index>.sqlite.qmd-writer-lock.sqlite`). Filesystem scanning and embedding computation can proceed outside SQLite write transactions, but database commits are serialized. Lease acquire, heartbeat, stale takeover, and release are conditional SQL mutations keyed by owner token, so an old owner cannot delete or overwrite a replacement owner. Same-host leases are only recovered when the owner PID is gone; remote-host leases can be recovered after the stale timeout. Malformed sidecars are left untouched and reported with an actionable error instead of being renamed automatically.
+
+Queries open the index read-only and use WAL snapshots, so hybrid search can return lexical plus available vector results while maintenance is running. Incomplete vector coverage is reported by `qmd status`/`qmd doctor` and does not force hybrid search to embed missing documents before returning.
+
+Useful environment variables:
+
+- `QMD_WRITER_LOCK_WAIT_MS`: maximum time a maintenance writer waits for the writer lock before failing fast (default `5000`).
+- `QMD_WRITER_LOCK_STALE_MS`: age after which an abandoned writer lock may be recovered (default `600000`).
+- `QMD_SQLITE_READ_BUSY_TIMEOUT_MS`: SQLite busy timeout for read-only query handles (default `500`).
+- `QMD_EMBED_CLAIM_TTL_MS`: lease duration for per-hash embedding claims (default `3600000`).
 
 ### Using with AI Agents
 
