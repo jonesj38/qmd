@@ -60,7 +60,7 @@ qmd search "API" --all --files --min-score 0.3
 
 `qmd update` and `qmd embed` coordinate SQLite writes with an atomic SQLite lease sidecar beside the active index (`<index>.sqlite.qmd-writer-lock.sqlite`). Filesystem scanning and embedding computation can proceed outside SQLite write transactions, but database commits are serialized. Lease acquire, heartbeat, stale takeover, and release are conditional SQL mutations keyed by owner token, so an old owner cannot delete or overwrite a replacement owner. Same-host leases are only recovered when the owner PID is gone; remote-host leases can be recovered after the stale timeout. Malformed sidecars are left untouched and reported with an actionable error instead of being renamed automatically.
 
-Queries open the index read-only and use WAL snapshots, so hybrid search can return lexical plus available vector results while maintenance is running. Incomplete vector coverage is reported by `qmd status`/`qmd doctor` and does not force hybrid search to embed missing documents before returning. Collection-scoped vector search scores only vectors from selected active collections when the selected scope is within the exact-scan threshold; larger selected scopes skip vector hits quickly so hybrid search can degrade to lexical results instead of performing an unbounded global vector scan.
+Queries open the index read-only and use WAL snapshots, so hybrid search can return lexical plus available vector results while maintenance is running. Incomplete vector coverage is reported by `qmd status`/`qmd doctor` and does not force hybrid search to embed missing documents before returning. Collection-scoped FTS runs bounded SQLite BM25 candidate queries anchored to each selected collection's indexed filepath prefix, then exact-filters hydrated rows by collection. Collection-scoped vector search budgets selected collections in stable input order so one large source collection does not erase artifact hits from smaller selected collections. Single-collection exact scoring uses the configured `5000` ceiling; multi-collection interactive scoring uses a `1000` aggregate target within that ceiling so artifact-first scopes stay responsive. Multi-collection hybrid searches score the original semantic query once across the aggregate vector budget, retain lexical expansions, and skip the extra remote rerank by default (unless callers explicitly request it) so lexical plus semantic retrieval stays within interactive turn budgets. Structured searches share the aggregate collection budget.
 
 Useful environment variables:
 
@@ -68,7 +68,8 @@ Useful environment variables:
 - `QMD_WRITER_LOCK_STALE_MS`: age after which an abandoned writer lock may be recovered (default `600000`).
 - `QMD_SQLITE_READ_BUSY_TIMEOUT_MS`: SQLite busy timeout for read-only query handles (default `500`).
 - `QMD_EMBED_CLAIM_TTL_MS`: lease duration for per-hash embedding claims (default `3600000`).
-- `QMD_SCOPED_VECTOR_EXACT_LIMIT`: maximum selected active vector chunks to score exactly for collection-scoped vector search (default `5000`).
+- `QMD_OPENAI_QUERY_TIMEOUT_MS`: per-call timeout for query-time OpenAI embedding, expansion, and rerank requests (default `3000`). Document embedding and maintenance batch embedding keep their normal retry behavior.
+- `QMD_SCOPED_VECTOR_EXACT_LIMIT`: maximum selected active vector chunks to score exactly across collection-scoped vector search (default `5000`).
 
 ### Using with AI Agents
 

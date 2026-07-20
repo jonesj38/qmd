@@ -333,8 +333,12 @@ function formatETA(seconds: number): string {
 
 
 // Check index health and print warnings/tips
-function checkIndexHealth(db: Database, model: string = resolveEmbedModelForCli()): void {
-  const { needsEmbedding, totalDocs, daysStale } = getIndexHealth(db, model);
+function checkIndexHealth(
+  db: Database,
+  model: string = resolveEmbedModelForCli(),
+  collection?: string | string[],
+): void {
+  const { needsEmbedding, totalDocs, daysStale } = getIndexHealth(db, model, collection);
 
   // Warn if many docs need embedding
   if (needsEmbedding > 0) {
@@ -2759,7 +2763,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
   const collectionNames = resolveCollectionFilter(opts.collection, true);
   const collectionFilter = collectionNames.length > 0 ? collectionNames : undefined;
 
-  checkIndexHealth(store.db);
+  // Health aggregation belongs to status/maintenance; retrieval must stay within its turn budget.
 
   const llmSession = async () => {
     let results = await vectorSearchQuery(store, query, {
@@ -2818,7 +2822,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
   const collectionNames = resolveCollectionFilter(opts.collection, true);
   const collectionFilter = collectionNames.length > 0 ? collectionNames : undefined;
 
-  checkIndexHealth(store.db);
+  // Health aggregation belongs to status/maintenance; retrieval must stay within its turn budget.
 
   // Check for structured query syntax (lex:/vec:/hyde:/intent: prefixes)
   const parsed = parseStructuredQuery(query);
@@ -2850,7 +2854,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
-        skipRerank: opts.skipRerank,
+        skipRerank: opts.skipRerank || undefined,
         explain: !!opts.explain,
         intent,
         chunkStrategy: opts.chunkStrategy,
@@ -2878,7 +2882,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
-        skipRerank: opts.skipRerank,
+        skipRerank: opts.skipRerank || undefined,
         explain: !!opts.explain,
         intent,
         chunkStrategy: opts.chunkStrategy,

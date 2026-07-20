@@ -213,7 +213,7 @@ export type LLMSessionOptions = {
 export interface ILLMSession {
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
   embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]>;
-  expandQuery(query: string, options?: { context?: string; includeLexical?: boolean }): Promise<Queryable[]>;
+  expandQuery(query: string, options?: { context?: string; includeLexical?: boolean; intent?: string }): Promise<Queryable[]>;
   rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult>;
   /** Whether this session is still valid (not released or aborted) */
   readonly isValid: boolean;
@@ -528,7 +528,7 @@ export interface LLM {
   /**
    * Get embeddings for multiple texts in a batch
    */
-  embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]>;
+  embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]>;
 
   /**
    * Get the model name used for embeddings
@@ -549,7 +549,7 @@ export interface LLM {
    * Expand a search query into multiple variations for different backends.
    * Returns a list of Queryable objects.
    */
-  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean }): Promise<Queryable[]>;
+  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean, intent?: string }): Promise<Queryable[]>;
 
   /**
    * Rerank documents by relevance to a query
@@ -1938,7 +1938,7 @@ class LLMSession implements ILLMSession {
 
   async expandQuery(
     query: string,
-    options?: { context?: string; includeLexical?: boolean }
+    options?: { context?: string; includeLexical?: boolean; intent?: string }
   ): Promise<Queryable[]> {
     return this.withOperation(() => this.manager.getLlamaCpp().expandQuery(query, options));
   }
@@ -2221,11 +2221,11 @@ class OpenAILLMSession implements ILLMSession {
     return this.llm.embed(text, options);
   }
 
-  async embedBatch(texts: string[], _options?: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
-    return this.llm.embedBatch(texts);
+  async embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
+    return this.llm.embedBatch(texts, options);
   }
 
-  async expandQuery(query: string, options?: { context?: string; includeLexical?: boolean }): Promise<Queryable[]> {
+  async expandQuery(query: string, options?: { context?: string; includeLexical?: boolean; intent?: string }): Promise<Queryable[]> {
     return this.llm.expandQuery(query, options);
   }
 

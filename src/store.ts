@@ -56,6 +56,8 @@ export const DEFAULT_EMBED_MAX_DOCS_PER_BATCH = 64;
 export const DEFAULT_EMBED_MAX_BATCH_BYTES = 64 * 1024 * 1024; // 64MB
 export const DEFAULT_EMBED_CLAIM_TTL_MS = 60 * 60 * 1000;
 export const DEFAULT_SCOPED_VECTOR_EXACT_LIMIT = 5_000;
+const SCOPED_VECTOR_SQL_BATCH_SIZE = 5_000;
+const MULTI_COLLECTION_SCOPED_VECTOR_EXACT_LIMIT = 1_000;
 
 const EMBED_FINGERPRINT_PROBE_QUERY = "__qmd_embedding_query_probe__";
 const EMBED_FINGERPRINT_PROBE_TITLE = "__qmd_embedding_title_probe__";
@@ -1272,6 +1274,7 @@ export type Store = {
   // Search
   searchFTS: (query: string, limit?: number, collections?: string | string[]) => SearchResult[];
   searchVec: (query: string, model: string, limit?: number, collections?: string | string[], session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
+  searchVecBatch: (embeddings: number[][], limit?: number, collections?: string | string[]) => SearchResult[][];
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string, intent?: string) => Promise<ExpandedQuery[]>;
@@ -2158,6 +2161,7 @@ export function createStore(dbPath?: string, options: CreateStoreOptions = {}): 
     // Search
     searchFTS: (query: string, limit?: number, collections?: string | string[]) => searchFTS(db, query, limit, collections),
     searchVec: (query: string, model: string, limit?: number, collections?: string | string[], session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collections, session, precomputedEmbedding),
+    searchVecBatch: (embeddings: number[][], limit?: number, collections?: string | string[]) => searchVecBatch(db, embeddings, limit, collections),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, intent, store.llm),
@@ -2486,11 +2490,22 @@ export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: 
   });
 }
 
-export function getIndexHealth(db: Database, model: string = DEFAULT_EMBED_MODEL): IndexHealthInfo {
-  const needsEmbedding = getHashesNeedingEmbedding(db, undefined, model);
-  const totalDocs = (db.prepare(`SELECT COUNT(*) as count FROM documents WHERE active = 1`).get() as { count: number }).count;
+export function getIndexHealth(
+  db: Database,
+  model: string = DEFAULT_EMBED_MODEL,
+  collection?: string | string[],
+): IndexHealthInfo {
+  const filter = buildCollectionSql(collection, "d");
+  const needsEmbedding = getHashesNeedingEmbedding(db, collection, model);
+  const totalDocs = (db.prepare(`
+    SELECT COUNT(*) as count FROM documents d
+    WHERE d.active = 1 ${filter.sql}
+  `).get(...filter.params) as { count: number }).count;
 
-  const mostRecent = db.prepare(`SELECT MAX(modified_at) as latest FROM documents WHERE active = 1`).get() as { latest: string | null };
+  const mostRecent = db.prepare(`
+    SELECT MAX(d.modified_at) as latest FROM documents d
+    WHERE d.active = 1 ${filter.sql}
+  `).get(...filter.params) as { latest: string | null };
   let daysStale: number | null = null;
   if (mostRecent?.latest) {
     const lastUpdate = new Date(mostRecent.latest);
@@ -3819,78 +3834,211 @@ export function validateLexQuery(query: string): string | null {
   return null;
 }
 
+type FtsMatch = { rowid: number; bm25_score: number };
+type FtsDocRow = {
+  id: number;
+  filepath: string;
+  display_path: string;
+  title: string;
+  body: string;
+  hash: string;
+};
+
+const SCOPED_FTS_COLLECTION_CANDIDATE_LIMIT = 5_000;
+const SCOPED_FTS_PAGE_SIZE = 100;
+const SCOPED_FTS_COLLECTION_DOC_LIMIT = 5_000;
+const FTS_BM25_WEIGHTS = [1.5, 4.0, 1.0] as const;
+const SCOPED_FTS_BM25_WEIGHTS = [0.0, 4.0, 1.0] as const;
+
+function ftsBm25Expression(weights: readonly [number, number, number]): string {
+  return `bm25(documents_fts, ${weights.join(", ")})`;
+}
+
+function sanitizeFtsPathPrefixPhrase(pathPrefix: string): string {
+  // Mirror unicode61 token boundaries for collection names. In particular,
+  // hyphens in names such as "front-end" are indexed as separate tokens;
+  // stripping punctuation would incorrectly search for the single token
+  // "frontend" and miss the collection entirely.
+  return normalizeCjkForFTS(pathPrefix)
+    .split(/[^\p{L}\p{N}]+/u)
+    .map(token => sanitizeFTS5Term(token))
+    .filter(Boolean)
+    .join(" ");
+}
+
+function buildScopedFtsQuery(ftsQuery: string, collection: string): string | null {
+  const collectionPhrase = sanitizeFtsPathPrefixPhrase(collection);
+  if (!collectionPhrase) return null;
+  return `(${ftsQuery}) AND filepath : ^ "${collectionPhrase}"`;
+}
+
+function getScopedFtsMatches(
+  db: Database,
+  ftsQuery: string,
+  collection: string,
+  limit: number,
+  offset: number,
+): FtsMatch[] {
+  const scopedQuery = buildScopedFtsQuery(ftsQuery, collection);
+  if (!scopedQuery || limit <= 0) return [];
+
+  // Keep MATCH as one indexed, collection-anchored FTS5 query. The filepath
+  // column has zero BM25 weight so the anchor gates candidates without letting
+  // collection-name/path tokens influence relevance ordering.
+  return db.prepare(`
+    SELECT rowid, ${ftsBm25Expression(SCOPED_FTS_BM25_WEIGHTS)} as bm25_score
+    FROM documents_fts
+    WHERE documents_fts MATCH ?
+    ORDER BY bm25_score ASC
+    LIMIT ? OFFSET ?
+  `).all(scopedQuery, limit, offset) as FtsMatch[];
+}
+
+function mergeFtsResults(results: SearchResult[], limit: number): SearchResult[] {
+  const bestByFilepath = new Map<string, SearchResult>();
+  for (const result of results) {
+    const existing = bestByFilepath.get(result.filepath);
+    if (!existing || result.score > existing.score) {
+      bestByFilepath.set(result.filepath, result);
+    }
+  }
+
+  return Array.from(bestByFilepath.values())
+    .sort((a, b) => b.score - a.score || a.displayPath.localeCompare(b.displayPath))
+    .slice(0, limit);
+}
+
+function isScopedFtsCollectionOversized(db: Database, collection: string): boolean {
+  const rows = db.prepare(`
+    SELECT 1 FROM documents
+    WHERE active = 1 AND collection = ?
+    LIMIT 1 OFFSET ?
+  `).all(collection, SCOPED_FTS_COLLECTION_DOC_LIMIT) as unknown[];
+  return rows.length > 0;
+}
+
+function hasScopedFtsCollectionPrefixCollision(db: Database, collection: string): boolean {
+  const target = sanitizeFtsPathPrefixPhrase(collection);
+  if (!target) return false;
+  const rows = db.prepare(`
+    SELECT DISTINCT collection FROM documents WHERE active = 1
+  `).all() as { collection: string }[];
+  return rows.some(row => row.collection !== collection &&
+    sanitizeFtsPathPrefixPhrase(row.collection).startsWith(`${target} `));
+}
+
+function searchScopedFts(db: Database, ftsQuery: string, collections: string[], limit: number): SearchResult[] {
+  if (limit <= 0) return [];
+  const results: SearchResult[] = [];
+  for (const collection of collections) {
+    // An individually huge source collection can make BM25 ORDER BY consume the
+    // entire turn even with an indexed anchor. Skip only that collection; later
+    // small artifact/source collections retain their lexical contribution.
+    if (isScopedFtsCollectionOversized(db, collection)) continue;
+
+    if (!hasScopedFtsCollectionPrefixCollision(db, collection)) {
+      const matches = getScopedFtsMatches(db, ftsQuery, collection, limit, 0);
+      results.push(...hydrateFtsMatches(db, matches, limit, collection));
+      continue;
+    }
+
+    const collectionResults: SearchResult[] = [];
+    let offset = 0;
+    while (offset < SCOPED_FTS_COLLECTION_CANDIDATE_LIMIT && collectionResults.length < limit) {
+      const pageLimit = Math.min(
+        SCOPED_FTS_PAGE_SIZE,
+        SCOPED_FTS_COLLECTION_CANDIDATE_LIMIT - offset,
+      );
+      const matches = getScopedFtsMatches(db, ftsQuery, collection, pageLimit, offset);
+      if (matches.length === 0) break;
+      collectionResults.push(...hydrateFtsMatches(
+        db, matches, limit - collectionResults.length, collection,
+      ));
+      offset += matches.length;
+      if (matches.length < pageLimit) break;
+    }
+    results.push(...collectionResults);
+  }
+  return mergeFtsResults(results, limit);
+}
+
+function hydrateFtsMatches(db: Database, matches: FtsMatch[], limit: number, collections?: string | string[]): SearchResult[] {
+  if (matches.length === 0) return [];
+
+  const rowids = matches.map(match => match.rowid);
+  const scoreByRowid = new Map(matches.map(match => [match.rowid, match.bm25_score]));
+  const collectionFilter = buildCollectionSql(collections, "d");
+  const rows: FtsDocRow[] = [];
+  const batchSize = 500;
+
+  for (let i = 0; i < rowids.length; i += batchSize) {
+    const batch = rowids.slice(i, i + batchSize);
+    const placeholders = batch.map(() => "?").join(",");
+    rows.push(...db.prepare(`
+      SELECT
+        d.id,
+        'qmd://' || d.collection || '/' || d.path as filepath,
+        d.collection || '/' || d.path as display_path,
+        d.title,
+        content.doc as body,
+        d.hash
+      FROM documents d
+      JOIN content ON content.hash = d.hash
+      WHERE d.id IN (${placeholders})
+        AND d.active = 1
+        ${collectionFilter.sql}
+    `).all(...batch, ...collectionFilter.params) as FtsDocRow[]);
+  }
+
+  return rows
+    .map(row => ({ row, bm25Score: scoreByRowid.get(row.id) ?? 0 }))
+    .sort((a, b) => a.bm25Score - b.bm25Score)
+    .slice(0, limit)
+    .map(({ row, bm25Score }) => {
+      const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
+      // Convert bm25 (negative, lower is better) into a stable [0..1) score where higher is better.
+      // FTS5 BM25 scores are negative (e.g., -10 is strong, -2 is weak).
+      // |x| / (1 + |x|) maps: strong(-10)→0.91, medium(-2)→0.67, weak(-0.5)→0.33, none(0)→0.
+      // Monotonic and query-independent — no per-query normalization needed.
+      const score = Math.abs(bm25Score) / (1 + Math.abs(bm25Score));
+      return {
+        filepath: row.filepath,
+        displayPath: row.display_path,
+        title: row.title,
+        hash: row.hash,
+        docid: getDocid(row.hash),
+        collectionName,
+        modifiedAt: "",  // Not available in FTS query
+        bodyLength: row.body.length,
+        body: row.body,
+        context: getContextForFile(db, row.filepath),
+        score,
+        source: "fts" as const,
+      };
+    });
+}
+
 export function searchFTS(db: Database, query: string, limit: number = 20, collections?: string | string[]): SearchResult[] {
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
-  // Use a CTE to force FTS5 to run first, then filter by collection.
-  // Without the CTE, SQLite's query planner combines FTS5 MATCH with the
-  // collection filter in a single WHERE clause, which can cause it to
-  // abandon the FTS5 index and fall back to a full scan — turning an 8ms
-  // query into a 17-second query on large collections.
-  const params: (string | number)[] = [ftsQuery];
+  // Never combine FTS5 MATCH with document joins and collection predicates in
+  // one statement: older planner choices can turn that shape into a full scan.
+  // For scoped searches, anchor each MATCH to the indexed filepath collection
+  // prefix, then hydrate and exact-filter the collection in a separate query.
+  const normalizedCollections = normalizeCollectionFilter(collections);
+  if (normalizedCollections.length > 0) {
+    return searchScopedFts(db, ftsQuery, normalizedCollections, limit);
+  }
 
-  // When filtering by collection, fetch extra candidates from the FTS index
-  // since some will be filtered out. Without a collection filter we can
-  // fetch exactly the requested limit.
-  // Collection-scoped searches are filtered after the FTS candidate pass.
-  // In a large global index, limit*10 can miss all matches from a tiny target
-  // collection even when that collection has strong matches. Use a wider
-  // candidate window for filtered searches while keeping unfiltered search exact.
-  const ftsLimit = collections ? Math.max(limit * 1000, 5000) : limit;
-
-  let sql = `
-    WITH fts_matches AS (
-      SELECT rowid, bm25(documents_fts, 1.5, 4.0, 1.0) as bm25_score
-      FROM documents_fts
-      WHERE documents_fts MATCH ?
-      ORDER BY bm25_score ASC
-      LIMIT ${ftsLimit}
-    )
-    SELECT
-      'qmd://' || d.collection || '/' || d.path as filepath,
-      d.collection || '/' || d.path as display_path,
-      d.title,
-      content.doc as body,
-      d.hash,
-      fm.bm25_score
-    FROM fts_matches fm
-    JOIN documents d ON d.id = fm.rowid
-    JOIN content ON content.hash = d.hash
-    WHERE d.active = 1
-  `;
-
-  const collectionFilter = buildCollectionSql(collections, "d");
-  sql += collectionFilter.sql;
-  params.push(...collectionFilter.params);
-
-  // bm25 lower is better; sort ascending.
-  sql += ` ORDER BY fm.bm25_score ASC LIMIT ?`;
-  params.push(limit);
-
-  const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number }[];
-  return rows.map(row => {
-    const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
-    // Convert bm25 (negative, lower is better) into a stable [0..1) score where higher is better.
-    // FTS5 BM25 scores are negative (e.g., -10 is strong, -2 is weak).
-    // |x| / (1 + |x|) maps: strong(-10)→0.91, medium(-2)→0.67, weak(-0.5)→0.33, none(0)→0.
-    // Monotonic and query-independent — no per-query normalization needed.
-    const score = Math.abs(row.bm25_score) / (1 + Math.abs(row.bm25_score));
-    return {
-      filepath: row.filepath,
-      displayPath: row.display_path,
-      title: row.title,
-      hash: row.hash,
-      docid: getDocid(row.hash),
-      collectionName,
-      modifiedAt: "",  // Not available in FTS query
-      bodyLength: row.body.length,
-      body: row.body,
-      context: getContextForFile(db, row.filepath),
-      score,
-      source: "fts" as const,
-    };
-  });
+  const matches = db.prepare(`
+    SELECT rowid, ${ftsBm25Expression(FTS_BM25_WEIGHTS)} as bm25_score
+    FROM documents_fts
+    WHERE documents_fts MATCH ?
+    ORDER BY bm25_score ASC
+    LIMIT ?
+  `).all(ftsQuery, limit) as FtsMatch[];
+  return hydrateFtsMatches(db, matches, limit);
 }
 
 // =============================================================================
@@ -3949,11 +4097,13 @@ function getGlobalVectorMatches(db: Database, embedding: number[], limit: number
 function getScopedVectorHashSeqs(db: Database, collections: string[], maxRows: number): string[] {
   const collectionFilter = buildCollectionSql(collections, "d");
   const sql = `
-    SELECT DISTINCT cv.hash || '_' || cv.seq as hash_seq
+    SELECT cv.hash || '_' || cv.seq as hash_seq
     FROM content_vectors cv
     JOIN documents d ON d.hash = cv.hash AND d.active = 1
     WHERE 1 = 1
     ${collectionFilter.sql}
+    GROUP BY cv.hash, cv.seq
+    ORDER BY cv.hash ASC, cv.seq ASC
     LIMIT ?
   `;
   return withLazyContentVectorMigration(db, () => (
@@ -3961,14 +4111,42 @@ function getScopedVectorHashSeqs(db: Database, collections: string[], maxRows: n
   )).map(row => row.hash_seq);
 }
 
-function getScopedVectorMatches(db: Database, embedding: number[], collections: string[], limit: number): VectorMatch[] | null {
-  const exactLimit = getScopedVectorExactLimit();
-  const scopedHashSeqs = getScopedVectorHashSeqs(db, collections, exactLimit + 1);
+function getBudgetedScopedVectorHashSeqs(db: Database, collections: string[], exactLimit: number): string[] {
+  if (exactLimit <= 0) return [];
+  const hashSeqs: string[] = [];
+  const seen = new Set<string>();
+
+  for (const collection of collections) {
+    const remaining = exactLimit - hashSeqs.length;
+    if (remaining <= 0) break;
+
+    const scoped = getScopedVectorHashSeqs(db, [collection], remaining + 1);
+    if (scoped.length > remaining) {
+      // Skip oversized collections rather than letting one large source scope
+      // suppress smaller selected collections or trigger an unbounded scan.
+      continue;
+    }
+
+    for (const hashSeq of scoped) {
+      if (seen.has(hashSeq)) continue;
+      seen.add(hashSeq);
+      hashSeqs.push(hashSeq);
+    }
+  }
+
+  return hashSeqs;
+}
+
+function getScopedVectorMatches(db: Database, embedding: number[], collections: string[], limit: number): VectorMatch[] {
+  const configuredLimit = getScopedVectorExactLimit();
+  const exactLimit = collections.length > 1
+    ? Math.min(configuredLimit, MULTI_COLLECTION_SCOPED_VECTOR_EXACT_LIMIT)
+    : configuredLimit;
+  const scopedHashSeqs = getBudgetedScopedVectorHashSeqs(db, collections, exactLimit);
   if (scopedHashSeqs.length === 0) return [];
-  if (scopedHashSeqs.length > exactLimit) return null;
 
   const matches: VectorMatch[] = [];
-  const batchSize = 500;
+  const batchSize = SCOPED_VECTOR_SQL_BATCH_SIZE;
   for (let i = 0; i < scopedHashSeqs.length; i += batchSize) {
     const batch = scopedHashSeqs.slice(i, i + batchSize);
     const placeholders = batch.map(() => "?").join(",");
@@ -3995,15 +4173,69 @@ function getScopedVectorMatches(db: Database, embedding: number[], collections: 
     .slice(0, Math.min(matches.length, Math.max(limit * 20, 200)));
 }
 
-function hydrateVectorMatches(db: Database, vecResults: VectorMatch[], limit: number, collections?: string | string[]): SearchResult[] {
-  if (vecResults.length === 0) return [];
-  // Step 2: Get chunk info and document data
-  const hashSeqs = vecResults.map(r => r.hash_seq);
-  const distanceMap = new Map(vecResults.map(r => [r.hash_seq, r.distance]));
+function getScopedVectorMatchesBatch(
+  db: Database,
+  embeddings: number[][],
+  collections: string[],
+  limit: number,
+): VectorMatch[][] {
+  if (embeddings.length === 0) return [];
+  const configuredLimit = getScopedVectorExactLimit();
+  const exactLimit = collections.length > 1
+    ? Math.min(configuredLimit, MULTI_COLLECTION_SCOPED_VECTOR_EXACT_LIMIT)
+    : configuredLimit;
+  const scopedHashSeqs = getBudgetedScopedVectorHashSeqs(db, collections, exactLimit);
+  const matches = embeddings.map(() => [] as VectorMatch[]);
+  const batchSize = SCOPED_VECTOR_SQL_BATCH_SIZE;
 
-  // Build query for document lookup
-  const placeholders = hashSeqs.map(() => '?').join(',');
-  let docSql = `
+  for (let i = 0; i < scopedHashSeqs.length; i += batchSize) {
+    const batch = scopedHashSeqs.slice(i, i + batchSize);
+    const placeholders = batch.map(() => "?").join(",");
+    const rows = db.prepare(`
+      SELECT hash_seq, embedding FROM vectors_vec
+      WHERE hash_seq IN (${placeholders})
+    `).all(...batch) as { hash_seq: string; embedding: unknown }[];
+
+    for (const row of rows) {
+      const vector = decodeSqliteVector(row.embedding);
+      if (!vector) continue;
+      for (let queryIndex = 0; queryIndex < embeddings.length; queryIndex++) {
+        const distance = cosineDistance(embeddings[queryIndex]!, vector);
+        if (distance !== null) matches[queryIndex]!.push({ hash_seq: row.hash_seq, distance });
+      }
+    }
+  }
+
+  const candidateLimit = Math.max(limit * 20, 200);
+  return matches.map(queryMatches => queryMatches
+    .sort((a, b) => a.distance - b.distance)
+    .slice(0, Math.min(queryMatches.length, candidateLimit)));
+}
+
+type VectorDocRow = {
+  hash_seq: string;
+  hash: string;
+  pos: number;
+  filepath: string;
+  display_path: string;
+  title: string;
+  body: string;
+};
+
+function getVectorDocRows(
+  db: Database,
+  hashSeqs: string[],
+  collections?: string | string[],
+): VectorDocRow[] {
+  if (hashSeqs.length === 0) return [];
+  const wantedHashSeqs = new Set(hashSeqs);
+  const hashes = [...new Set(hashSeqs.map(hashSeq => {
+    const separator = hashSeq.lastIndexOf("_");
+    return separator >= 0 ? hashSeq.slice(0, separator) : hashSeq;
+  }))];
+  const placeholders = hashes.map(() => "?").join(",");
+  const collectionFilter = buildCollectionSql(collections, "d");
+  const rows = withLazyContentVectorMigration(db, () => db.prepare(`
     SELECT
       cv.hash || '_' || cv.seq as hash_seq,
       cv.hash,
@@ -4015,23 +4247,26 @@ function hydrateVectorMatches(db: Database, vecResults: VectorMatch[], limit: nu
     FROM content_vectors cv
     JOIN documents d ON d.hash = cv.hash AND d.active = 1
     JOIN content ON content.hash = d.hash
-    WHERE cv.hash || '_' || cv.seq IN (${placeholders})
-  `;
-  const params: string[] = [...hashSeqs];
+    WHERE cv.hash IN (${placeholders})
+    ${collectionFilter.sql}
+  `).all(...hashes, ...collectionFilter.params) as VectorDocRow[]);
+  // A hash can have multiple chunk sequences. Use the indexed hash lookup in
+  // SQL, then restore exact hash_seq semantics over the small hydrated set.
+  return rows.filter(row => wantedHashSeqs.has(row.hash_seq));
+}
 
-  const docCollectionFilter = buildCollectionSql(collections, "d");
-  docSql += docCollectionFilter.sql;
-  params.push(...docCollectionFilter.params);
-
-  const docRows = withLazyContentVectorMigration(db, () => db.prepare(docSql).all(...params) as {
-    hash_seq: string; hash: string; pos: number; filepath: string;
-    display_path: string; title: string; body: string;
-  }[]);
-
-  // Combine with distances and dedupe by filepath
-  const seen = new Map<string, { row: typeof docRows[0]; bestDist: number }>();
+function hydrateVectorMatchesFromRows(
+  db: Database,
+  docRows: VectorDocRow[],
+  vecResults: VectorMatch[],
+  limit: number,
+): SearchResult[] {
+  if (vecResults.length === 0) return [];
+  const distanceMap = new Map(vecResults.map(result => [result.hash_seq, result.distance]));
+  const seen = new Map<string, { row: VectorDocRow; bestDist: number }>();
   for (const row of docRows) {
-    const distance = distanceMap.get(row.hash_seq) ?? 1;
+    const distance = distanceMap.get(row.hash_seq);
+    if (distance === undefined) continue;
     const existing = seen.get(row.filepath);
     if (!existing || distance < existing.bestDist) {
       seen.set(row.filepath, { row, bestDist: distance });
@@ -4050,15 +4285,20 @@ function hydrateVectorMatches(db: Database, vecResults: VectorMatch[], limit: nu
         hash: row.hash,
         docid: getDocid(row.hash),
         collectionName,
-        modifiedAt: "",  // Not available in vec query
+        modifiedAt: "",
         bodyLength: row.body.length,
         body: row.body,
         context: getContextForFile(db, row.filepath),
-        score: 1 - bestDist,  // Cosine similarity = 1 - cosine distance
+        score: 1 - bestDist,
         source: "vec" as const,
         chunkPos: row.pos,
       };
     });
+}
+
+function hydrateVectorMatches(db: Database, vecResults: VectorMatch[], limit: number, collections?: string | string[]): SearchResult[] {
+  const docRows = getVectorDocRows(db, vecResults.map(result => result.hash_seq), collections);
+  return hydrateVectorMatchesFromRows(db, docRows, vecResults, limit);
 }
 
 export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collections?: string | string[], session?: ILLMSession, precomputedEmbedding?: number[]): Promise<SearchResult[]> {
@@ -4076,8 +4316,34 @@ export async function searchVec(db: Database, query: string, model: string, limi
     ? getScopedVectorMatches(db, embedding, normalizedCollections, limit)
     : getGlobalVectorMatches(db, embedding, limit * 3);
 
-  if (!vecResults || vecResults.length === 0) return [];
+  if (vecResults.length === 0) return [];
   return hydrateVectorMatches(db, vecResults, limit, normalizedCollections);
+}
+
+
+export function searchVecBatch(
+  db: Database,
+  embeddings: number[][],
+  limit: number = 20,
+  collections?: string | string[],
+): SearchResult[][] {
+  if (embeddings.length === 0) return [];
+  const tableExists = db.prepare(
+    `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`,
+  ).get();
+  if (!tableExists) return embeddings.map(() => []);
+
+  const normalizedCollections = normalizeCollectionFilter(collections);
+  const matches = normalizedCollections.length > 0
+    ? getScopedVectorMatchesBatch(db, embeddings, normalizedCollections, limit)
+    : embeddings.map(embedding => getGlobalVectorMatches(db, embedding, limit * 3));
+  const allHashSeqs = [...new Set(matches.flatMap(result =>
+    result.map(match => match.hash_seq)
+  ))];
+  const docRows = getVectorDocRows(db, allHashSeqs, normalizedCollections);
+  return matches.map(result => hydrateVectorMatchesFromRows(
+    db, docRows, result, limit,
+  ));
 }
 
 // =============================================================================
@@ -5090,7 +5356,11 @@ export async function hybridQuery(
   const collection = options?.collection;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
-  const skipRerank = options?.skipRerank ?? false;
+  // Multi-collection scoped retrieval already performs expansion, lexical,
+  // and semantic ranking. Skip the additional remote rerank by default so the
+  // complete pipeline remains inside interactive turn budgets; callers can
+  // explicitly pass false when they prefer reranking over bounded latency.
+  const skipRerank = options?.skipRerank ?? normalizeCollectionFilter(collection).length > 1;
   const hooks = options?.hooks;
 
   const rankedLists: RankedResult[][] = [];
@@ -5164,36 +5434,46 @@ export async function hybridQuery(
     const vecQueries: { text: string; queryType: "original" | "vec" | "hyde" }[] = [
       { text: query, queryType: "original" },
     ];
+    const boundedMultiCollection = normalizeCollectionFilter(collection).length > 1;
     for (const q of expanded) {
-      if (q.type === 'vec' || q.type === 'hyde') {
+      // Exact scoped scoring loads a bounded vector set and scores it in-process.
+      // Across multiple collections, retain the original semantic query and the
+      // lexical expansions, but do not multiply the exact scan for vec/HyDE
+      // variants. This keeps semantic retrieval real while bounding the turn.
+      if (!boundedMultiCollection && (q.type === 'vec' || q.type === 'hyde')) {
         vecQueries.push({ text: q.query, queryType: q.type });
       }
     }
+    // Timeout/error fallbacks can repeat the original as a vec expansion.
+    // Keep the original's stronger evidence label and avoid scoring the same
+    // embedding twice under a tight turn budget.
+    const seenVecTexts = new Set<string>();
+    const uniqueVecQueries = vecQueries.filter(entry => {
+      if (seenVecTexts.has(entry.text)) return false;
+      seenVecTexts.add(entry.text);
+      return true;
+    });
 
     // Batch embed all vector queries in a single call
     const llm = isUsingOpenAI() ? getDefaultEmbeddingLLM() : getLlm(store);
     const embedModel = isUsingOpenAI() ? llm.getModelName() : (llm as LlamaCpp).embedModelName;
-    const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, embedModel));
+    const textsToEmbed = uniqueVecQueries.map(q => formatQueryForEmbedding(q.text, embedModel));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
     try {
-      const embeddings = await llm.embedBatch(textsToEmbed);
+      const embeddings = await llm.embedBatch(textsToEmbed, { isQuery: true });
       hooks?.onEmbedDone?.(Date.now() - embedStart);
 
-      // Run sqlite-vec lookups with pre-computed embeddings
-      for (let i = 0; i < vecQueries.length; i++) {
+      // Score all query vectors while loading each scoped vector only once.
+      const valid = embeddings.map(result => result?.embedding).filter(
+        (embedding): embedding is number[] => !!embedding,
+      );
+      const vecResultSets = store.searchVecBatch(valid, 20, collection);
+      let resultIndex = 0;
+      for (let i = 0; i < uniqueVecQueries.length; i++) {
         const embedding = embeddings[i]?.embedding;
         if (!embedding) continue;
-
-        let vecResults: SearchResult[] = [];
-        try {
-          vecResults = await store.searchVec(
-            vecQueries[i]!.text, embedModel, 20, collection,
-            undefined, embedding
-          );
-        } catch {
-          vecResults = [];
-        }
+        const vecResults = vecResultSets[resultIndex++] ?? [];
         if (vecResults.length > 0) {
           for (const r of vecResults) docidMap.set(r.filepath, r.docid);
           rankedLists.push(vecResults.map(r => ({
@@ -5202,8 +5482,8 @@ export async function hybridQuery(
           })));
           rankedListMeta.push({
             source: "vec",
-            queryType: vecQueries[i]!.queryType,
-            query: vecQueries[i]!.text,
+            queryType: uniqueVecQueries[i]!.queryType,
+            query: uniqueVecQueries[i]!.text,
           });
         }
       }
@@ -5429,14 +5709,41 @@ export async function vectorSearchQuery(
   const vecExpanded = allExpanded.filter(q => q.type !== 'lex');
   options?.hooks?.onExpand?.(query, vecExpanded, Date.now() - expandStart);
 
-  // Run original + vec/hyde expanded through vector, sequentially — concurrent embed() hangs
-  const embedModel = getLlm(store).embedModelName;
-  const queryTexts = [query, ...vecExpanded.map(q => q.query)];
+  // Deduplicate expansions in stable order; timeout fallbacks can repeat the
+  // original query verbatim and must not trigger duplicate remote work.
+  const queryTexts = [...new Set([query, ...vecExpanded.map(q => q.query)])];
+  const openAI = isUsingOpenAI();
+  const llm = openAI ? getDefaultEmbeddingLLM() : getLlm(store);
+  const embedModel = openAI ? llm.getModelName() : (llm as LlamaCpp).embedModelName;
   const allResults = new Map<string, VectorSearchResult>();
-  for (const q of queryTexts) {
+
+  // OpenAI supports native batch embedding, which gives the whole vector-only
+  // query one bounded remote stage. Local llama stays sequential because its
+  // embedding contexts cannot safely serve concurrent query calls.
+  const precomputed = openAI
+    ? await llm.embedBatch(
+        queryTexts.map(text => formatQueryForEmbedding(text, embedModel)),
+        { isQuery: true },
+      )
+    : null;
+  const openAIEmbeddings = precomputed?.map(result => result?.embedding).filter(
+    (embedding): embedding is number[] => !!embedding,
+  ) ?? [];
+  const openAIResultSets = openAI
+    ? store.searchVecBatch(openAIEmbeddings, limit, collection)
+    : [];
+  let openAIResultIndex = 0;
+
+  for (let i = 0; i < queryTexts.length; i++) {
+    const q = queryTexts[i]!;
+    const embedding = precomputed?.[i]?.embedding;
+    if (openAI && !embedding) continue;
+
     let vecResults: SearchResult[] = [];
     try {
-      vecResults = await store.searchVec(q, embedModel, limit, collection);
+      vecResults = openAI
+        ? (openAIResultSets[openAIResultIndex++] ?? [])
+        : await store.searchVec(q, embedModel, limit, collection);
     } catch {
       vecResults = [];
     }
@@ -5512,10 +5819,9 @@ export async function structuredSearch(
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
-  const skipRerank = options?.skipRerank ?? false;
-  const hooks = options?.hooks;
-
   const collections = options?.collections;
+  const skipRerank = options?.skipRerank ?? normalizeCollectionFilter(collections).length > 1;
+  const hooks = options?.hooks;
 
   if (searches.length === 0) return [];
 
@@ -5550,26 +5856,24 @@ export async function structuredSearch(
     hasVectors = false;
   }
 
-  // Helper to run search across collections (or all if undefined)
-  const collectionList = collections ?? [undefined]; // undefined = all collections
+  const normalizedCollections = normalizeCollectionFilter(collections);
+  const collectionFilter = normalizedCollections.length > 0 ? normalizedCollections : undefined;
 
   // Step 1: Run FTS for all lex searches (sync, instant)
   for (const search of searches) {
     if (search.type === 'lex') {
-      for (const coll of collectionList) {
-        const ftsResults = store.searchFTS(search.query, 20, coll);
-        if (ftsResults.length > 0) {
-          for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
-          rankedLists.push(ftsResults.map(r => ({
-            file: r.filepath, displayPath: r.displayPath,
-            title: r.title, body: r.body || "", score: r.score,
-          })));
-          rankedListMeta.push({
-            source: "fts",
-            queryType: "lex",
-            query: search.query,
-          });
-        }
+      const ftsResults = store.searchFTS(search.query, 20, collectionFilter);
+      if (ftsResults.length > 0) {
+        for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
+        rankedLists.push(ftsResults.map(r => ({
+          file: r.filepath, displayPath: r.displayPath,
+          title: r.title, body: r.body || "", score: r.score,
+        })));
+        rankedListMeta.push({
+          source: "fts",
+          queryType: "lex",
+          query: search.query,
+        });
       }
     }
   }
@@ -5587,35 +5891,29 @@ export async function structuredSearch(
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
       try {
-        const embeddings = await llm.embedBatch(textsToEmbed);
+        const embeddings = await llm.embedBatch(textsToEmbed, { isQuery: true });
         hooks?.onEmbedDone?.(Date.now() - embedStart);
 
+        const valid = embeddings.map(result => result?.embedding).filter(
+          (embedding): embedding is number[] => !!embedding,
+        );
+        const vecResultSets = store.searchVecBatch(valid, 20, collectionFilter);
+        let resultIndex = 0;
         for (let i = 0; i < vecSearches.length; i++) {
           const embedding = embeddings[i]?.embedding;
           if (!embedding) continue;
-
-          for (const coll of collectionList) {
-            let vecResults: SearchResult[] = [];
-            try {
-              vecResults = await store.searchVec(
-                vecSearches[i]!.query, modelName, 20, coll,
-                undefined, embedding
-              );
-            } catch {
-              vecResults = [];
-            }
-            if (vecResults.length > 0) {
-              for (const r of vecResults) docidMap.set(r.filepath, r.docid);
-              rankedLists.push(vecResults.map(r => ({
-                file: r.filepath, displayPath: r.displayPath,
-                title: r.title, body: r.body || "", score: r.score,
-              })));
-              rankedListMeta.push({
-                source: "vec",
-                queryType: vecSearches[i]!.type,
-                query: vecSearches[i]!.query,
-              });
-            }
+          const vecResults = vecResultSets[resultIndex++] ?? [];
+          if (vecResults.length > 0) {
+            for (const r of vecResults) docidMap.set(r.filepath, r.docid);
+            rankedLists.push(vecResults.map(r => ({
+              file: r.filepath, displayPath: r.displayPath,
+              title: r.title, body: r.body || "", score: r.score,
+            })));
+            rankedListMeta.push({
+              source: "vec",
+              queryType: vecSearches[i]!.type,
+              query: vecSearches[i]!.query,
+            });
           }
         }
       } catch {

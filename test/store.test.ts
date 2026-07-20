@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
 import * as llmModule from "../src/llm.js";
-import { disposeDefaultLlamaCpp, setDefaultLlamaCpp } from "../src/llm.js";
+import { disposeDefaultLlamaCpp, getDefaultEmbeddingLLM, setDefaultLlamaCpp, setEmbeddingConfig } from "../src/llm.js";
 import {
   createStore,
   verifySqliteVecLoaded,
@@ -1369,6 +1369,105 @@ describe("FTS Search", () => {
     expect(filtered[0]!.displayPath).toBe(`${collection1}/doc1.md`);
 
     await cleanupTestDb(store);
+  });
+
+  test("searchFTS scoped BM25 scores ignore collection anchor tokens", async () => {
+    const store = await createTestStore();
+    const shortCollection = await createTestCollection({ pwd: "/path/a", name: "a" });
+    const longCollection = await createTestCollection({ pwd: "/path/rare-long-collection-name", name: "rare-long-collection-name" });
+
+    try {
+      for (const collection of [shortCollection, longCollection]) {
+        await insertTestDocument(store.db, collection, {
+          name: "same",
+          title: "Canonical Task Status",
+          body: "canonical task status evidence with identical lexical content",
+          displayPath: "same.md",
+        });
+      }
+
+      const results = store.searchFTS("canonical task status", 10, [shortCollection, longCollection]);
+      expect(results).toHaveLength(2);
+      expect(results[0]!.score).toBeCloseTo(results[1]!.score, 6);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("searchFTS finds selected docs behind more than 5000 off-scope candidates", async () => {
+    const store = await createTestStore();
+    const targetCollection = await createTestCollection({ pwd: "/path/artifact", glob: "**/*.md", name: "artifact" });
+    const distractorCollection = await createTestCollection({ pwd: "/path/source", glob: "**/*.md", name: "source" });
+    const now = new Date().toISOString();
+
+    try {
+      const insertDistractors = store.db.transaction(() => {
+        for (let i = 0; i < 5050; i++) {
+          const hash = `offscope-${i}`;
+          const body = `needle needle needle off-scope source distractor ${i}`;
+          insertContent(store.db, hash, body, now);
+          insertDocument(store.db, distractorCollection, `distractors/${i}.md`, `Needle Source ${i}`, hash, now, now);
+        }
+      });
+
+      insertDistractors();
+      const ftsRows = store.db.prepare(`
+        SELECT COUNT(*) AS count
+        FROM documents_fts
+        WHERE documents_fts MATCH ?
+      `).get('"needle"*') as { count: number };
+      expect(ftsRows.count).toBeGreaterThan(5000);
+
+      await insertTestDocument(store.db, targetCollection, {
+        name: "selected",
+        hash: "selected-needle",
+        title: "Selected Artifact",
+        body: "needle artifact target",
+        displayPath: "selected.md",
+      });
+
+      const results = store.searchFTS("needle", 1, [distractorCollection, targetCollection]);
+
+      expect(results).toHaveLength(1);
+      expect(results[0]?.filepath).toBe(`qmd://${targetCollection}/selected.md`);
+      expect(results[0]?.collectionName).toBe(targetCollection);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("searchFTS exact-filters collection token prefix collisions", async () => {
+    const store = await createTestStore();
+    const targetCollection = await createTestCollection({ pwd: "/path/foo", glob: "**/*.md", name: "foo" });
+    const collisionCollection = await createTestCollection({ pwd: "/path/foo-bar", glob: "**/*.md", name: "foo-bar" });
+    const now = new Date().toISOString();
+
+    try {
+      const insertCollisions = store.db.transaction(() => {
+        for (let i = 0; i < 1_500; i++) {
+          const hash = `collision-${i}`;
+          insertContent(store.db, hash, `collisionterm collisionterm prefix collection ${i}`, now);
+          insertDocument(store.db, collisionCollection, `collision-${i}.md`, `Collision ${i}`, hash, now, now);
+        }
+      });
+
+      insertCollisions();
+      await insertTestDocument(store.db, targetCollection, {
+        name: "target",
+        hash: "target-prefix-collision",
+        title: "Target",
+        body: "collisionterm target collection",
+        displayPath: "target.md",
+      });
+
+      const results = store.searchFTS("collisionterm", 5, targetCollection);
+
+      expect(results).toHaveLength(1);
+      expect(results[0]?.filepath).toBe(`qmd://${targetCollection}/target.md`);
+      expect(results[0]?.collectionName).toBe(targetCollection);
+    } finally {
+      await cleanupTestDb(store);
+    }
   });
 
   test("searchFTS finds CJK documents by exact and mixed queries", async () => {
@@ -3524,14 +3623,14 @@ describe("Embedding batching", () => {
       embedding: [1, 2, 3],
       model,
     })));
-    const searchVecSpy = vi.fn(async () => [] as SearchResult[]) as any;
+    const searchVecBatchSpy = vi.fn(() => [[]] as SearchResult[][]) as any;
 
     store.db.exec(`CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)`);
     store.llm = {
       embedModelName: model,
       embedBatch: embedBatchSpy,
     } as any;
-    store.searchVec = searchVecSpy as any;
+    store.searchVecBatch = searchVecBatchSpy;
     store.searchFTS = vi.fn(() => []) as any;
     store.expandQuery = vi.fn(async () => []) as any;
 
@@ -3539,10 +3638,10 @@ describe("Embedding batching", () => {
       await hybridQuery(store, "hybrid query", { limit: 5, minScore: 0, skipRerank: true });
 
       expect(embedBatchSpy).toHaveBeenCalledTimes(1);
-      expect(searchVecSpy).toHaveBeenCalledTimes(1);
-      expect(searchVecSpy.mock.calls[0]?.[0]).toBe("hybrid query");
-      expect(searchVecSpy.mock.calls[0]?.[1]).toBe(model);
-      expect(searchVecSpy.mock.calls[0]?.[5]).toEqual([1, 2, 3]);
+      expect(embedBatchSpy.mock.calls[0]?.[1]).toEqual({ isQuery: true });
+      expect(searchVecBatchSpy).toHaveBeenCalledTimes(1);
+      expect(searchVecBatchSpy.mock.calls[0]?.[0]).toEqual([[1, 2, 3]]);
+      expect(searchVecBatchSpy.mock.calls[0]?.[1]).toBe(20);
     } finally {
       await cleanupTestDb(store);
     }
@@ -3555,7 +3654,7 @@ describe("Embedding batching", () => {
       embedding: [1, 2, 3],
       model,
     })));
-    const searchVecSpy = vi.fn(async () => [] as SearchResult[]) as any;
+    const searchVecBatchSpy = vi.fn(() => [[]] as SearchResult[][]) as any;
     const searchFtsSpy = vi.fn(() => [] as SearchResult[]) as any;
 
     store.db.exec(`CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)`);
@@ -3563,7 +3662,7 @@ describe("Embedding batching", () => {
       embedModelName: model,
       embedBatch: embedBatchSpy,
     } as any;
-    store.searchVec = searchVecSpy as any;
+    store.searchVecBatch = searchVecBatchSpy;
     store.searchFTS = searchFtsSpy as any;
     store.expandQuery = vi.fn(async () => []) as any;
 
@@ -3576,7 +3675,7 @@ describe("Embedding batching", () => {
       });
 
       expect(searchFtsSpy).toHaveBeenCalledWith("hybrid query", 20, ["coll-a", "coll-b"]);
-      expect(searchVecSpy.mock.calls[0]?.[3]).toEqual(["coll-a", "coll-b"]);
+      expect(searchVecBatchSpy.mock.calls[0]?.[2]).toEqual(["coll-a", "coll-b"]);
     } finally {
       await cleanupTestDb(store);
     }
@@ -3667,6 +3766,53 @@ describe("Embedding batching", () => {
     }
   });
 
+  test("searchVec retains small collection hits when another selected collection exceeds vector budget", async () => {
+    const previousLimit = process.env.QMD_SCOPED_VECTOR_EXACT_LIMIT;
+    process.env.QMD_SCOPED_VECTOR_EXACT_LIMIT = "2";
+    const store = await createTestStore();
+    const largeCollection = await createTestCollection({ name: "large-source", pwd: "/test/large-source" });
+    const smallCollection = await createTestCollection({ name: "artifact", pwd: "/test/artifact" });
+    const model = "test-model";
+    const now = new Date().toISOString();
+
+    try {
+      store.ensureVecTable(3);
+      for (let i = 0; i < 3; i++) {
+        const hash = `large-vector-${i}`;
+        await insertTestDocument(store.db, largeCollection, {
+          name: `large-${i}`,
+          hash,
+          displayPath: `large-${i}.md`,
+          body: `large source semantic distractor ${i}`,
+        });
+        store.insertEmbedding(hash, 0, 0, new Float32Array([1, 0, 0]), model, now);
+      }
+
+      await insertTestDocument(store.db, smallCollection, {
+        name: "artifact-hit",
+        hash: "small-artifact-vector",
+        displayPath: "artifact-hit.md",
+        body: "small artifact semantic result",
+      });
+      store.insertEmbedding("small-artifact-vector", 0, 0, new Float32Array([0.8, 0.6, 0]), model, now);
+
+      const results = await store.searchVec(
+        "semantic artifact",
+        model,
+        10,
+        [largeCollection, smallCollection],
+        undefined,
+        [1, 0, 0],
+      );
+
+      expect(results.map(result => result.filepath)).toEqual([`qmd://${smallCollection}/artifact-hit.md`]);
+    } finally {
+      if (previousLimit === undefined) delete process.env.QMD_SCOPED_VECTOR_EXACT_LIMIT;
+      else process.env.QMD_SCOPED_VECTOR_EXACT_LIMIT = previousLimit;
+      await cleanupTestDb(store);
+    }
+  });
+
   test("hybridQuery uses available selected vectors while lexical-only docs remain useful", async () => {
     const store = await createTestStore();
     const collection = await createTestCollection({ name: "artifact", pwd: "/test/artifact" });
@@ -3711,6 +3857,52 @@ describe("Embedding batching", () => {
     }
   });
 
+  test("hybridQuery degrades to lexical results when query embeddings are unavailable", async () => {
+    const store = await createTestStore();
+    const model = "hf:test/embed-model.gguf";
+    const lexicalOnly: SearchResult = {
+      filepath: "qmd://coll-a/lexical.md",
+      displayPath: "coll-a/lexical.md",
+      title: "Lexical",
+      hash: "lexicalhash",
+      docid: "lexica",
+      collectionName: "coll-a",
+      modifiedAt: "",
+      bodyLength: 34,
+      body: "# Lexical\n\nquery embedding fallback",
+      context: null,
+      score: 0.9,
+      source: "fts",
+    };
+    const embedBatchSpy = vi.fn(async () => [null]);
+    const searchVecSpy = vi.fn(async () => [] as SearchResult[]) as any;
+
+    store.db.exec(`CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)`);
+    store.llm = {
+      embedModelName: model,
+      embedBatch: embedBatchSpy,
+    } as any;
+    store.searchFTS = vi.fn(() => [lexicalOnly]) as any;
+    store.searchVec = searchVecSpy as any;
+    store.expandQuery = vi.fn(async () => []) as any;
+
+    try {
+      const results = await hybridQuery(store, "query embedding fallback", {
+        collection: ["coll-a"],
+        limit: 5,
+        minScore: 0,
+        skipRerank: true,
+      });
+
+      expect(embedBatchSpy.mock.calls[0]?.[1]).toEqual({ isQuery: true });
+      expect(searchVecSpy).not.toHaveBeenCalled();
+      expect(results).toHaveLength(1);
+      expect(results[0]?.file).toBe("qmd://coll-a/lexical.md");
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
   test("hybridQuery returns useful degraded results when only some docs have vectors", async () => {
     const store = await createTestStore();
     const model = "hf:test/embed-model.gguf";
@@ -3750,7 +3942,7 @@ describe("Embedding batching", () => {
       embedBatch: vi.fn(async () => [{ embedding: [1, 2, 3], model }]),
     } as any;
     store.searchFTS = vi.fn(() => [lexicalOnly]) as any;
-    store.searchVec = vi.fn(async () => [vectorHit]) as any;
+    store.searchVecBatch = vi.fn(() => [[vectorHit]]) as any;
     store.expandQuery = vi.fn(async () => []) as any;
 
     try {
@@ -3794,7 +3986,7 @@ describe("Embedding batching", () => {
       embedBatch: vi.fn(async () => [{ embedding: [1, 2, 3], model }]),
     } as any;
     store.searchFTS = vi.fn(() => [lexicalOnly]) as any;
-    store.searchVec = vi.fn(async () => {
+    store.searchVecBatch = vi.fn(() => {
       throw new Error("database is locked");
     }) as any;
     store.expandQuery = vi.fn(async () => []) as any;
@@ -3816,6 +4008,78 @@ describe("Embedding batching", () => {
     }
   });
 
+  test("structuredSearch applies selected collections as one bounded retrieval scope", async () => {
+    const store = await createTestStore();
+    const model = "hf:test/embed-model.gguf";
+    const searchFtsSpy = vi.fn(() => [] as SearchResult[]) as any;
+    const searchVecBatchSpy = vi.fn(() => [[]] as SearchResult[][]) as any;
+
+    store.db.exec(`CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)`);
+    store.llm = {
+      embedModelName: model,
+      embedBatch: vi.fn(async () => [{ embedding: [1, 2, 3], model }]),
+    } as any;
+    store.searchFTS = searchFtsSpy;
+    store.searchVecBatch = searchVecBatchSpy;
+
+    try {
+      await structuredSearch(store, [
+        { type: "lex", query: "bounded lexical" },
+        { type: "vec", query: "bounded semantic" },
+      ], {
+        collections: ["artifact-a", "large-source", "artifact-b"],
+        limit: 5,
+        minScore: 0,
+        skipRerank: true,
+      });
+
+      expect(searchFtsSpy).toHaveBeenCalledTimes(1);
+      expect(searchFtsSpy).toHaveBeenCalledWith(
+        "bounded lexical", 20, ["artifact-a", "large-source", "artifact-b"],
+      );
+      expect(searchVecBatchSpy).toHaveBeenCalledTimes(1);
+      expect(searchVecBatchSpy.mock.calls[0]?.[2]).toEqual(["artifact-a", "large-source", "artifact-b"]);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("vectorSearchQuery OpenAI mode does not read the local LlamaCpp model", async () => {
+    const store = await createTestStore();
+    const local = {} as Record<string, unknown>;
+    Object.defineProperty(local, "embedModelName", {
+      get() { throw new Error("local embed model must not be read in OpenAI mode"); },
+    });
+
+    store.db.exec(`CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)`);
+    store.expandQuery = vi.fn(async () => []) as any;
+    store.searchVec = vi.fn(async () => [] as SearchResult[]) as any;
+    store.searchVecBatch = vi.fn(() => [[]]) as any;
+    setDefaultLlamaCpp(local as any);
+    setEmbeddingConfig({ provider: "openai", openai: { apiKey: "test-key", embedModel: "openai-test-model" } });
+    const openaiLlm = getDefaultEmbeddingLLM();
+    openaiLlm.embedBatch = vi.fn(async () => [{
+      embedding: [1, 2, 3], model: "openai-test-model",
+    }]);
+
+    try {
+      await expect(vectorSearchQuery(store, "openai vector query", {
+        collection: ["artifact"], limit: 5, minScore: 0,
+      })).resolves.toEqual([]);
+      expect(openaiLlm.embedBatch).toHaveBeenCalledWith(
+        expect.any(Array), { isQuery: true },
+      );
+      expect(store.searchVecBatch).toHaveBeenCalledWith(
+        [[1, 2, 3]], 5, ["artifact"],
+      );
+      expect(store.searchVec).not.toHaveBeenCalled();
+    } finally {
+      setEmbeddingConfig({ provider: "local" });
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
   test("structuredSearch uses the active llm embed model for precomputed vector lookups", async () => {
     const store = await createTestStore();
     const model = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";
@@ -3823,14 +4087,14 @@ describe("Embedding batching", () => {
       embedding: [1, 2, 3],
       model,
     })));
-    const searchVecSpy = vi.fn(async () => [] as SearchResult[]) as any;
+    const searchVecBatchSpy = vi.fn(() => [[]] as SearchResult[][]) as any;
 
     store.db.exec(`CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)`);
     store.llm = {
       embedModelName: model,
       embedBatch: embedBatchSpy,
     } as any;
-    store.searchVec = searchVecSpy as any;
+    store.searchVecBatch = searchVecBatchSpy;
 
     try {
       await structuredSearch(store, [{ type: "vec", query: "structured query" }], {
@@ -3840,10 +4104,10 @@ describe("Embedding batching", () => {
       });
 
       expect(embedBatchSpy).toHaveBeenCalledTimes(1);
-      expect(searchVecSpy).toHaveBeenCalledTimes(1);
-      expect(searchVecSpy.mock.calls[0]?.[0]).toBe("structured query");
-      expect(searchVecSpy.mock.calls[0]?.[1]).toBe(model);
-      expect(searchVecSpy.mock.calls[0]?.[5]).toEqual([1, 2, 3]);
+      expect(embedBatchSpy.mock.calls[0]?.[1]).toEqual({ isQuery: true });
+      expect(searchVecBatchSpy).toHaveBeenCalledTimes(1);
+      expect(searchVecBatchSpy.mock.calls[0]?.[0]).toEqual([[1, 2, 3]]);
+      expect(searchVecBatchSpy.mock.calls[0]?.[1]).toBe(20);
     } finally {
       await cleanupTestDb(store);
     }

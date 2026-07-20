@@ -59,6 +59,61 @@ function truncateToTokenLimit(text: string, maxTokens: number): string {
 
 const DEFAULT_EMBED_MODEL = 'text-embedding-3-small';
 const DEFAULT_EXPANSION_MODEL = 'gpt-4o-mini';
+export const DEFAULT_OPENAI_QUERY_TIMEOUT_MS = 3_000;
+type OpenAIQueryRequestOptions = {
+  timeout: number;
+  maxRetries: 0;
+  signal: AbortSignal;
+};
+
+function getOpenAIQueryTimeoutMs(): number {
+  const parsed = parseInt(process.env.QMD_OPENAI_QUERY_TIMEOUT_MS ?? '', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_OPENAI_QUERY_TIMEOUT_MS;
+}
+
+function getOpenAIQueryRequestOptions(signal: AbortSignal): OpenAIQueryRequestOptions {
+  return {
+    timeout: getOpenAIQueryTimeoutMs(),
+    maxRetries: 0,
+    signal,
+  };
+}
+
+function createOpenAIQueryTimeoutError(context: string, timeoutMs: number): Error {
+  const error = new Error(`[OpenAI] ${context} timed out after ${timeoutMs}ms`);
+  error.name = 'AbortError';
+  return error;
+}
+
+async function withOpenAIQueryDeadline<T>(
+  context: string,
+  fn: (options: OpenAIQueryRequestOptions) => Promise<T>
+): Promise<T> {
+  const timeoutMs = getOpenAIQueryTimeoutMs();
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const error = createOpenAIQueryTimeoutError(context, timeoutMs);
+      controller.abort(error);
+      reject(error);
+    }, timeoutMs);
+  });
+
+  const requestPromise = Promise.resolve().then(() =>
+    fn(getOpenAIQueryRequestOptions(controller.signal))
+  );
+  // If the SDK/fetch promise rejects after the application-level race has
+  // already returned, keep that late rejection from surfacing as unhandled.
+  void requestPromise.catch(() => undefined);
+
+  try {
+    return await Promise.race([requestPromise, timeoutPromise]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 /**
  * OpenAI API calls must be stateless. Bun's fetch/runtime can retain or attach
@@ -223,6 +278,29 @@ export class OpenAIEmbedding implements LLM {
 
   async embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
     const input = truncateToTokenLimit(text, this.maxInputTokens);
+    if (options?.isQuery) {
+      try {
+        const response = await withOpenAIQueryDeadline('query embedding', requestOptions =>
+          this.client.embeddings.create({
+            model: this.embedModel,
+            input,
+          }, requestOptions)
+        );
+        const data = response.data[0];
+        if (!data) {
+          throw new Error('No embedding data returned from OpenAI');
+        }
+        return {
+          embedding: data.embedding,
+          model: this.embedModel,
+        };
+      } catch (error) {
+        console.warn('[OpenAI] Query embedding failed, continuing without vector results:',
+          error instanceof Error ? error.message : String(error));
+        return null;
+      }
+    }
+
     return withRetry(async () => {
       const response = await this.client.embeddings.create({
         model: this.embedModel,
@@ -243,8 +321,27 @@ export class OpenAIEmbedding implements LLM {
     return this.embedModel;
   }
 
-  async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+  async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
     const inputs = texts.map(t => truncateToTokenLimit(t, this.maxInputTokens));
+    if (options.isQuery) {
+      try {
+        const response = await withOpenAIQueryDeadline('query embedding batch', requestOptions =>
+          this.client.embeddings.create({
+            model: this.embedModel,
+            input: inputs,
+          }, requestOptions)
+        );
+        return response.data.map(item => ({
+          embedding: item.embedding,
+          model: this.embedModel,
+        }));
+      } catch (error) {
+        console.warn('[OpenAI] Query embedding batch failed, continuing without vector results:',
+          error instanceof Error ? error.message : String(error));
+        return texts.map(() => null);
+      }
+    }
+
     return withRetry(async () => {
       // OpenAI supports batch embedding natively
       const response = await this.client.embeddings.create({
@@ -272,16 +369,17 @@ export class OpenAIEmbedding implements LLM {
     };
   }
 
-  async expandQuery(query: string, options?: { context?: string, includeLexical?: boolean }): Promise<Queryable[]> {
+  async expandQuery(query: string, options?: { context?: string, includeLexical?: boolean, intent?: string }): Promise<Queryable[]> {
     const includeLexical = options?.includeLexical ?? true;
     
     try {
-      const response = await withRetry(() => this.chatClient.chat.completions.create({
-        model: this.expansionModel,
-        messages: [
-          {
-            role: 'system',
-            content: `You are a search query expander. Given a search query, generate expanded versions for different search backends.
+      const response = await withOpenAIQueryDeadline('query expansion', requestOptions =>
+        this.chatClient.chat.completions.create({
+          model: this.expansionModel,
+          messages: [
+            {
+              role: 'system',
+              content: `You are a search query expander. Given a search query, generate expanded versions for different search backends.
 
 Output format (one per line):
 lex: <keyword query for BM25 text search>
@@ -289,15 +387,16 @@ vec: <semantic query for vector search>
 hyde: <hypothetical document snippet that would answer the query>
 
 Generate 1-2 of each type. Be concise. Include the original query terms.`
-          },
-          {
-            role: 'user',
-            content: query
-          }
-        ],
-        temperature: 0.7,
-        max_tokens: 300,
-      }), { context: 'expandQuery' });
+            },
+            {
+              role: 'user',
+              content: query
+            }
+          ],
+          temperature: 0.7,
+          max_tokens: 300,
+        }, requestOptions)
+      );
 
       const content = response.choices[0]?.message?.content || '';
       const lines = content.trim().split('\n');
@@ -361,24 +460,26 @@ Generate 1-2 of each type. Be concise. Include the original query terms.`
         `[${i}] ${doc.title ? doc.title + ': ' : ''}${doc.text.slice(0, 500).replace(/\n+/g, ' ')}`
       );
 
-      const response = await withRetry(() => this.rerankClient.chat.completions.create({
-        model: this.rerankModel,
-        messages: [
-          {
-            role: 'system',
-            content: `You are a document relevance ranker. Given a search query and numbered documents, rank them by relevance.
+      const response = await withOpenAIQueryDeadline('rerank', requestOptions =>
+        this.rerankClient.chat.completions.create({
+          model: this.rerankModel,
+          messages: [
+            {
+              role: 'system',
+              content: `You are a document relevance ranker. Given a search query and numbered documents, rank them by relevance.
 
 Output ONLY a comma-separated list of document indices, most relevant first. Include ALL indices exactly once.
 Example output for 5 documents: 2,0,4,1,3`
-          },
-          {
-            role: 'user',
-            content: `Query: ${query}\n\nDocuments:\n${truncated.join('\n\n')}`
-          }
-        ],
-        temperature: 0,
-        max_tokens: 200,
-      }), { context: 'rerank' });
+            },
+            {
+              role: 'user',
+              content: `Query: ${query}\n\nDocuments:\n${truncated.join('\n\n')}`
+            }
+          ],
+          temperature: 0,
+          max_tokens: 200,
+        }, requestOptions)
+      );
 
       const content = response.choices[0]?.message?.content?.trim() || '';
       
