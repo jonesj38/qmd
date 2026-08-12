@@ -16,6 +16,7 @@ import { setTimeout as sleep } from "timers/promises";
 import { buildEditorUri, termLink, resolveEmbedModelForCli } from "../src/cli/qmd.ts";
 import { openDatabase } from "../src/db.ts";
 import { DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI } from "../src/llm.ts";
+import { getEmbeddingFingerprint } from "../src/store.ts";
 import { setConfigSource } from "../src/collections.ts";
 
 // Test fixtures directory and database path
@@ -115,6 +116,18 @@ async function createIsolatedTestEnv(prefix: string): Promise<{ dbPath: string; 
   await mkdir(configDir, { recursive: true });
   await writeFile(join(configDir, "index.yml"), "collections: {}\n");
   return { dbPath, configDir };
+}
+
+function markCollectionHashEmbedded(dbPath: string, collection: string, path: string, model: string): void {
+  const db = openDatabase(dbPath);
+  const doc = db.prepare(`
+    SELECT hash FROM documents WHERE collection = ? AND path = ? AND active = 1
+  `).get(collection, path) as { hash: string };
+  db.prepare(`
+    INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, total_chunks, embedded_at)
+    VALUES (?, 0, 0, ?, ?, 1, ?)
+  `).run(doc.hash, model, getEmbeddingFingerprint(model), new Date().toISOString());
+  db.close();
 }
 
 // Setup test fixtures
@@ -964,6 +977,81 @@ describe("CLI Update Command", () => {
     const { stdout, exitCode } = await runQmd(["update"], { dbPath: localDbPath });
     expect(exitCode).toBe(0);
     expect(stdout).toContain("Updating");
+  });
+
+  test("uses the configured embedding model for the update backlog", async () => {
+    const { dbPath, configDir } = await createIsolatedTestEnv("update-embed-model");
+    const collectionDir = join(testDir, `update-embed-model-${Date.now()}`);
+    const embedModel = "hf:configured/embed-model.gguf";
+    await mkdir(collectionDir, { recursive: true });
+    await writeFile(join(collectionDir, "embedded.md"), "# Already Embedded\n");
+
+    expect((await runQmd(
+      ["collection", "add", collectionDir, "--name", "configured-model"],
+      { dbPath, configDir, env: { QMD_EMBED_MODEL: embedModel } },
+    )).exitCode).toBe(0);
+    markCollectionHashEmbedded(dbPath, "configured-model", "embedded.md", embedModel);
+
+    const { stdout, exitCode } = await runQmd(["update"], {
+      dbPath,
+      configDir,
+      env: { QMD_EMBED_MODEL: embedModel },
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).not.toContain("unique hashes need vectors");
+  });
+
+  test("scoped updates count distinct pending hashes only in selected collections", async () => {
+    const { dbPath, configDir } = await createIsolatedTestEnv("update-backlog-scope");
+    const firstDir = join(testDir, `update-backlog-first-${Date.now()}`);
+    const secondDir = join(testDir, `update-backlog-second-${Date.now()}`);
+    const outsideDir = join(testDir, `update-backlog-outside-${Date.now()}`);
+    await mkdir(firstDir, { recursive: true });
+    await mkdir(secondDir, { recursive: true });
+    await mkdir(outsideDir, { recursive: true });
+    await writeFile(join(firstDir, "shared.md"), "# Shared Pending Hash\n");
+    await writeFile(join(secondDir, "shared.md"), "# Shared Pending Hash\n");
+    await writeFile(join(outsideDir, "outside.md"), "# Outside Pending Hash\n");
+
+    expect((await runQmd(["collection", "add", firstDir, "--name", "scope-first"], { dbPath, configDir })).exitCode).toBe(0);
+    expect((await runQmd(["collection", "add", secondDir, "--name", "scope-second"], { dbPath, configDir })).exitCode).toBe(0);
+    expect((await runQmd(["collection", "add", outsideDir, "--name", "scope-outside"], { dbPath, configDir })).exitCode).toBe(0);
+
+    const scoped = await runQmd(
+      ["update", "-c", "scope-first", "-c", "scope-second"],
+      { dbPath, configDir },
+    );
+    expect(scoped.exitCode).toBe(0);
+    expect(scoped.stdout).toContain("(1 unique hashes need vectors)");
+
+    const global = await runQmd(["update"], { dbPath, configDir });
+    expect(global.exitCode).toBe(0);
+    expect(global.stdout).toContain("(2 unique hashes need vectors)");
+  });
+
+  test("single-collection reindex backlog uses its collection and configured model", async () => {
+    const { dbPath, configDir } = await createIsolatedTestEnv("add-backlog-scope");
+    const sourceDir = join(testDir, `add-backlog-source-${Date.now()}`);
+    const addedDir = join(testDir, `add-backlog-added-${Date.now()}`);
+    const embedModel = "hf:configured/single-collection.gguf";
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(addedDir, { recursive: true });
+    await writeFile(join(sourceDir, "shared.md"), "# Shared Embedded Hash\n");
+    await writeFile(join(sourceDir, "outside.md"), "# Outside Pending Hash\n");
+    await writeFile(join(addedDir, "shared.md"), "# Shared Embedded Hash\n");
+
+    expect((await runQmd(
+      ["collection", "add", sourceDir, "--name", "add-source"],
+      { dbPath, configDir, env: { QMD_EMBED_MODEL: embedModel } },
+    )).exitCode).toBe(0);
+    markCollectionHashEmbedded(dbPath, "add-source", "shared.md", embedModel);
+
+    const { stdout, exitCode } = await runQmd(
+      ["collection", "add", addedDir, "--name", "add-selected"],
+      { dbPath, configDir, env: { QMD_EMBED_MODEL: embedModel } },
+    );
+    expect(exitCode).toBe(0);
+    expect(stdout).not.toContain("unique hashes need vectors");
   });
 
   test("updates only requested collection with -c", async () => {

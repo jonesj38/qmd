@@ -818,8 +818,12 @@ async function updateCollections(collectionOption?: string | string[]): Promise<
     console.log("");
   }
 
-  // Check if any documents need embedding (show once at end)
-  const needsEmbedding = getHashesNeedingEmbedding(db);
+  // Check if any documents need embedding (show once at end). Keep an
+  // unscoped update global, but report only the collections explicitly updated.
+  const embeddingScope = collectionFilter.length > 0
+    ? collections.map(collection => collection.name)
+    : undefined;
+  const needsEmbedding = getHashesNeedingEmbedding(db, embeddingScope, resolveEmbedModelForCli());
   closeDb();
 
   console.log(`${c.green}✓ All collections updated.${c.reset}`);
@@ -1977,8 +1981,8 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   // Clean up orphaned content hashes (content not referenced by any document)
   const orphanedContent = cleanupOrphanedContent(db);
 
-  // Check if vector index needs updating
-  const needsEmbedding = getHashesNeedingEmbedding(db);
+  // Check if this collection's vector index needs updating for the active model.
+  const needsEmbedding = getHashesNeedingEmbedding(db, collectionName, resolveEmbedModelForCli());
 
   progress.clear();
   console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
