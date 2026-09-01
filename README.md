@@ -550,7 +550,7 @@ qmd embed -f
 
 Supported local paths:
 - **EmbeddingGemma** (default) — preserves QMD's existing asymmetric prompts.
-- **gte-modernbert-base** — opt-in quality-oriented CPU preset (~532 MB Q8 GGUF).
+- **gte-modernbert-base** — opt-in quality-oriented CPU preset (~160 MB Q8 GGUF).
 - **bge-small-en-v1.5** — opt-in fast 384d CPU baseline.
 - **Qwen3-Embedding** — existing multilingual control; not selected automatically.
 
@@ -984,8 +984,10 @@ qmd bench src/bench/fixtures/example.json --json
 > ```
 
 Each query runs against four backends. JSON output records the exact fixture SHA-256,
-Recall@10/40/100, MRR, binary nDCG@10, latency, aggregate throughput, database size
-(when an explicit DB path is used), and peak process RSS:
+Recall@10/40/100, MRR, binary nDCG@10, latency, search throughput, SQLite index size,
+peak process RSS, and the active embedding identity/fingerprint. The ordinary command
+keeps its historical top-10 retrieval depth, so use the frozen matrix runner below
+when Recall@40/100 must be measured from 100 returned candidates:
 
 | Backend | What it tests | LLM required |
 |---------|---------------|--------------|
@@ -1028,9 +1030,13 @@ claim; QMD does not claim model or pipeline parity without measured frozen runs.
 field (`exact`, `semantic`, `topical`, `cross-domain`, `alias`) labels queries for
 grouping — it does not change search behavior.
 
-> **Heads-up:** if the fixture's collection isn't indexed, bench currently runs to
-> completion and reports all zeros with no warning. Verify setup with
-> `qmd ls <collection>` first.
+Backend failures are marked `not_measured` with the underlying reason and are excluded
+from summaries; placeholder metric fields remain only for JSON compatibility.
+
+For the reproducible five-model comparison (quality-cpu, fast-cpu, EmbeddingGemma,
+Qwen3 control, and OpenAI `text-embedding-3-small`) across vector-only,
+hybrid-no-rerank, and full modes, see [`bench/README.md`](bench/README.md). The runner
+uses already-prepared independent indexes and never downloads a model matrix.
 
 ## Data Storage
 

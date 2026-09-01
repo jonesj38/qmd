@@ -33,6 +33,10 @@ export interface BenchmarkFixture {
 }
 
 export interface BackendResult {
+  /** Whether the backend returned a result set that can be scored. */
+  status: "measured" | "not_measured";
+  /** Present when status is not_measured; never interpret placeholder zeros as scores. */
+  not_measured_reason?: string;
   /** Fraction of top-k results that are relevant */
   precision_at_k: number;
   /** Fraction of expected files found anywhere in results */
@@ -82,8 +86,13 @@ export interface BenchmarkResult {
     node: string;
     platform: string;
     arch: string;
-    db_size_bytes?: number;
+    /** Main SQLite database plus any live WAL/journal sidecars. */
+    index_size_bytes?: number;
+    index_files?: Record<string, number>;
     peak_rss_bytes: number;
+    embedding_provider: "local" | "openai";
+    embedding_identity: import("../store.js").EmbeddingIdentity;
+    embedding_fingerprint: string;
   };
   results: QueryResult[];
   summary: Record<string, {
@@ -99,6 +108,6 @@ export interface BenchmarkResult {
     avg_mrr: number;
     avg_f1: number;
     avg_latency_ms: number;
-    throughput_queries_per_second: number;
+    search_queries_per_second: number;
   }>;
 }

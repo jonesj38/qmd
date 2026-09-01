@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "runs": {
+    "quality-cpu": {
+      "not_measured_reason": "replace with db_path, config_path, and artifact_path after preparing this one model index"
+    },
+    "fast-cpu": {
+      "not_measured_reason": "replace with db_path, config_path, and artifact_path after preparing this one model index"
+    },
+    "embeddinggemma": {
+      "not_measured_reason": "replace with db_path, config_path, and artifact_path after preparing this one model index"
+    },
+    "qwen3-control": {
+      "not_measured_reason": "backend/model support was not verified on this host"
+    },
+    "openai-text-embedding-3-small": {
+      "not_measured_reason": "no prepared OpenAI index and API configuration were supplied"
+    }
+  }
+}

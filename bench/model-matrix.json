@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "name": "qmd-cpu-embedding-matrix-2026-09-01",
+  "frozen_at": "2026-09-01T22:00:00Z",
+  "fixture": {
+    "path": "../src/bench/fixtures/example.json",
+    "sha256": "8449121504d235912dac5d4874bb1c4670d03f90fd720f4ac632174b6c4548e9"
+  },
+  "corpus": {
+    "path": "../test/eval-docs",
+    "sha256_tree_v1": "07e260b2a7c5f34b816e25255c442a5e83b21a676933e1b2162a37a7c54936a2"
+  },
+  "retrieval": {
+    "cutoffs": [10, 40, 100],
+    "max_results": 100,
+    "modes": ["vector-only", "hybrid-no-rerank", "full"]
+  },
+  "full_pipeline": {
+    "generator": {
+      "model": "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf",
+      "revision": "7816de0b72572c6c860ca1eddf97ba9e7fb8cc65",
+      "artifact_sha256": "000dfb1c06efa6a049e9f64ba921c3740e2454f62abab6fa10e77bd30bb2bcc0"
+    },
+    "reranker": {
+      "model": "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf",
+      "revision": "a02f48bb4f057028298c21fa033da2b30d7742d5",
+      "artifact_sha256": "22c9979ce4fbcdc5acdc310c6641c32797eff1aa980b8f7a2db8a8ea23429a48"
+    }
+  },
+  "models": [
+    {
+      "id": "quality-cpu",
+      "provider": "local",
+      "model": "hf:cstr/gte-modernbert-base-GGUF/gte-modernbert-base-q8_0.gguf",
+      "identity_reference": "file:gte-modernbert-base-q8_0.gguf",
+      "revision": "3ab6878f7bdf655265a49adb56f48f73d3c640a9",
+      "artifact_sha256": "581c00ab554bb740e5b454c029e6e278c22c20cfe4c7905f4313d8f452b15cb6",
+      "artifact_size_bytes": 159660096,
+      "full_supported": true
+    },
+    {
+      "id": "fast-cpu",
+      "provider": "local",
+      "model": "hf:ggml-org/bge-small-en-v1.5-Q8_0-GGUF/bge-small-en-v1.5-q8_0.gguf",
+      "identity_reference": "file:bge-small-en-v1.5-q8_0.gguf",
+      "revision": "f2068edd9b54f2a369549ccc71f70ed273a2a801",
+      "artifact_sha256": "f046db1dc724cf4f6f0a0c5917e922823b73eb1d27b8f9a9c2797f7866974804",
+      "artifact_size_bytes": 36685152,
+      "full_supported": true
+    },
+    {
+      "id": "embeddinggemma",
+      "provider": "local",
+      "model": "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf",
+      "identity_reference": "file:embeddinggemma-300M-Q8_0.gguf",
+      "revision": "0f741b5a6585bd53aeb15cd1372c56f2a0f65e12",
+      "artifact_sha256": "b5ce9d77a3fc4b3b39ccb5643c36777911cc4eb46a66962eadfa3f5f60490d63",
+      "artifact_size_bytes": 333590944,
+      "full_supported": true
+    },
+    {
+      "id": "qwen3-control",
+      "provider": "local",
+      "model": "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf",
+      "identity_reference": "file:Qwen3-Embedding-0.6B-Q8_0.gguf",
+      "revision": "370f27d7550e0def9b39c1f16d3fbaa13aa67728",
+      "artifact_sha256": "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439",
+      "artifact_size_bytes": 639150592,
+      "control": true,
+      "full_supported": true
+    },
+    {
+      "id": "openai-text-embedding-3-small",
+      "provider": "openai",
+      "model": "text-embedding-3-small",
+      "identity_reference": "text-embedding-3-small",
+      "revision": "openai-model-snapshot-not-exposed",
+      "control": true,
+      "full_supported": false,
+      "full_not_measured_reason": "QMD routes full-mode expansion and reranking through mutable OpenAI chat deployments; this manifest has no snapshot-stable remote full pipeline"
+    }
+  ]
+}

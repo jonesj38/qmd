@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 - Add embedding identity v2 with model/fingerprint-safe vector hydration, opt-in CPU encoder presets, frozen retrieval benchmark metrics, and bounded adaptive candidate expansion.
+- Add a no-download frozen five-model benchmark manifest/runner with distinct vector, literal hybrid, and full modes plus explicit unavailable measurements.
 
 ### Documentation
 

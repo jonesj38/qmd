@@ -14,7 +14,7 @@
  *   - full: Full hybrid pipeline with LLM reranking
  */
 
-import { readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { createHash } from "node:crypto";
 import {
@@ -25,6 +25,8 @@ import {
   type HybridQueryResult,
   type ExpandedQuery,
 } from "../index.js";
+import { getEmbeddingFingerprint, getEmbeddingIdentity } from "../store.js";
+import { getEmbeddingConfig } from "../llm.js";
 import { scoreResults } from "./score.js";
 import type {
   BenchmarkFixture,
@@ -36,6 +38,7 @@ import type {
 
 type Backend = {
   name: string;
+  default: boolean;
   run: (store: QMDStore, query: BenchmarkQuery, limit: number, collection?: string) => Promise<string[]>;
 };
 
@@ -43,6 +46,13 @@ type ParsedStructuredQuery = {
   searches: ExpandedQuery[];
   intent?: string;
 };
+
+function safeFailureReason(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return (message || "backend failed without an error message")
+    .replace(/sk-[A-Za-z0-9_-]+/g, "[redacted-api-key]")
+    .replace(/(https?:\/\/)[^/@\s]+@/g, "$1[redacted]@");
+}
 
 function parseStructuredQuery(query: string): ParsedStructuredQuery | undefined {
   const lines = query.split("\n").map((line, idx) => ({
@@ -109,6 +119,7 @@ function uniqueFiles(files: string[], limit: number): string[] {
 const BACKENDS: Backend[] = [
   {
     name: "bm25",
+    default: true,
     run: async (store, query, limit, collection) => {
       const structured = parseStructuredQuery(query.query);
       const lexQueries = structured?.searches.filter(q => q.type === "lex");
@@ -127,6 +138,7 @@ const BACKENDS: Backend[] = [
   },
   {
     name: "vector",
+    default: true,
     run: async (store, query, limit, collection) => {
       const structured = parseStructuredQuery(query.query);
       const vectorQueries = structured?.searches.filter(q => q.type === "vec" || q.type === "hyde");
@@ -145,22 +157,47 @@ const BACKENDS: Backend[] = [
   },
   {
     name: "hybrid",
+    default: true,
     run: async (store, query, limit, collection) => {
       const structured = parseStructuredQuery(query.query);
       const results = structured
-        ? await store.search({ queries: structured.searches, intent: structured.intent, limit, candidateLimit: limit, collection, rerank: false })
-        : await store.search({ query: query.query, limit, candidateLimit: limit, collection, rerank: false });
+        ? await store.search({ queries: structured.searches, intent: structured.intent, limit, collection, rerank: false })
+        : await store.search({ query: query.query, limit, collection, rerank: false });
       return results.map((r: HybridQueryResult) => r.file);
     },
   },
   {
     name: "full",
+    default: true,
     run: async (store, query, limit, collection) => {
       const structured = parseStructuredQuery(query.query);
       const results = structured
-        ? await store.search({ queries: structured.searches, intent: structured.intent, limit, candidateLimit: 40, adaptive: true, adaptiveMaxCandidates: limit, collection, rerank: true })
-        : await store.search({ query: query.query, limit, candidateLimit: 40, adaptive: true, adaptiveMaxCandidates: limit, collection, rerank: true });
+        ? await store.search({ queries: structured.searches, intent: structured.intent, limit, collection, rerank: true })
+        : await store.search({ query: query.query, limit, collection, rerank: true });
       return results.map((r: HybridQueryResult) => r.file);
+    },
+  },
+  {
+    // Matrix-only path: fuse the same literal query from BM25 and vector
+    // retrieval. This excludes query expansion and reranking by construction.
+    name: "hybrid-no-rerank",
+    default: false,
+    run: async (store, query, limit, collection) => {
+      const [lex, vector] = await Promise.all([
+        store.searchLex(query.query, { limit, collection }),
+        store.searchVector(query.query, { limit, collection }),
+      ]);
+      const scores = new Map<string, number>();
+      for (const list of [lex, vector]) {
+        list.forEach((result, rank) => {
+          const file = result.filepath;
+          scores.set(file, (scores.get(file) ?? 0) + 1 / (60 + rank + 1));
+        });
+      }
+      return [...scores.entries()]
+        .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+        .slice(0, limit)
+        .map(([file]) => file);
     },
   },
 ];
@@ -170,17 +207,21 @@ async function runQuery(
   backend: Backend,
   query: BenchmarkQuery,
   collection?: string,
+  maxResults?: number,
 ): Promise<BackendResult> {
-  // Always retrieve the frozen cutoffs so Recall@10/40/100 is comparable.
-  const limit = Math.max(query.expected_in_top_k, 100);
+  // Keep qmd bench's historical top-10 behavior unless a matrix run explicitly
+  // requests a deeper frozen cutoff.
+  const limit = Math.max(query.expected_in_top_k, maxResults ?? 10);
   const start = Date.now();
 
   let resultFiles: string[];
   try {
     resultFiles = await backend.run(store, query, limit, collection);
-  } catch {
-    // Backend may not be available (e.g., no embeddings for vector search)
+  } catch (error) {
+    const reason = safeFailureReason(error);
     return {
+      status: "not_measured",
+      not_measured_reason: reason,
       precision_at_k: 0,
       recall: 0,
       recall_at_1: 0,
@@ -205,6 +246,7 @@ async function runQuery(
   const scores = scoreResults(resultFiles, query.expected_files, query.expected_in_top_k);
 
   return {
+    status: "measured",
     ...scores,
     total_expected: query.expected_files.length,
     latency_ms,
@@ -224,6 +266,10 @@ function formatTable(results: QueryResult[]): string {
 
   for (const r of results) {
     for (const [backend, br] of Object.entries(r.backends)) {
+      if (br.status === "not_measured") {
+        lines.push(`${pad(r.id, 25)} ${pad(backend, 8)} not measured: ${br.not_measured_reason}`);
+        continue;
+      }
       lines.push(
         `${pad(r.id, 25)} ${pad(backend, 8)} ${num(br.precision_at_k)} ${num(br.recall_at_1)} ${num(br.recall_at_3)} ${num(br.recall_at_5)} ${num(br.mrr)} ${num(br.f1)} ${String(Math.round(br.latency_ms)).padStart(7)}ms`
       );
@@ -234,7 +280,7 @@ function formatTable(results: QueryResult[]): string {
   return lines.join("\n");
 }
 
-function computeSummary(results: QueryResult[]): BenchmarkResult["summary"] {
+export function computeSummary(results: QueryResult[]): BenchmarkResult["summary"] {
   const summary: BenchmarkResult["summary"] = {};
 
   // Collect all backend names
@@ -249,7 +295,7 @@ function computeSummary(results: QueryResult[]): BenchmarkResult["summary"] {
     let totalP = 0, totalR = 0, totalR1 = 0, totalR3 = 0, totalR5 = 0, totalR10 = 0, totalR40 = 0, totalR100 = 0, totalNdcg10 = 0, totalMrr = 0, totalF1 = 0, totalLat = 0, count = 0;
     for (const r of results) {
       const br = r.backends[name];
-      if (!br) continue;
+      if (!br || br.status !== "measured") continue;
       totalP += br.precision_at_k;
       totalR += br.recall;
       totalR1 += br.recall_at_1;
@@ -278,7 +324,7 @@ function computeSummary(results: QueryResult[]): BenchmarkResult["summary"] {
         avg_mrr: totalMrr / count,
         avg_f1: totalF1 / count,
         avg_latency_ms: totalLat / count,
-        throughput_queries_per_second: totalLat > 0 ? count * 1000 / totalLat : 0,
+        search_queries_per_second: totalLat > 0 ? count * 1000 / totalLat : 0,
       };
     }
   }
@@ -288,7 +334,16 @@ function computeSummary(results: QueryResult[]): BenchmarkResult["summary"] {
 
 export async function runBenchmark(
   fixturePath: string,
-  options: { json?: boolean; collection?: string; backends?: string[]; dbPath?: string; configPath?: string } = {},
+  options: {
+    json?: boolean;
+    quiet?: boolean;
+    collection?: string;
+    backends?: string[];
+    dbPath?: string;
+    configPath?: string;
+    /** Opt-in retrieval depth for frozen matrix runs; qmd bench remains top-10. */
+    maxResults?: number;
+  } = {},
 ): Promise<BenchmarkResult> {
   // Load fixture
   const fixtureBytes = readFileSync(resolve(fixturePath));
@@ -309,9 +364,15 @@ export async function runBenchmark(
   // Filter backends if requested
   const activeBackends = options.backends
     ? BACKENDS.filter(b => options.backends!.includes(b.name))
-    : BACKENDS;
+    : BACKENDS.filter(b => b.default);
 
   const collection = options.collection ?? fixture.collection;
+  const embeddingConfig = getEmbeddingConfig();
+  const embeddingModel = embeddingConfig.provider === "openai"
+    ? embeddingConfig.openai?.embedModel ?? "text-embedding-3-small"
+    : store.internal.llm?.embedModelName;
+  const embeddingIdentity = getEmbeddingIdentity(embeddingModel);
+  const dbPath = options.dbPath ?? getDefaultDbPath();
 
   // Run queries
   const results: QueryResult[] = [];
@@ -319,11 +380,11 @@ export async function runBenchmark(
     const backends: Record<string, BackendResult> = {};
 
     for (const backend of activeBackends) {
-      if (!options.json) {
+      if (!options.json && !options.quiet) {
         process.stderr.write(`  ${query.id} / ${backend.name}...`);
       }
-      backends[backend.name] = await runQuery(store, backend, query, collection);
-      if (!options.json) {
+      backends[backend.name] = await runQuery(store, backend, query, collection, options.maxResults);
+      if (!options.json && !options.quiet) {
         process.stderr.write(` ${Math.round(backends[backend.name]!.latency_ms)}ms\n`);
       }
     }
@@ -338,6 +399,12 @@ export async function runBenchmark(
 
   await store.close();
 
+  const indexFiles: Record<string, number> = {};
+  for (const suffix of ["", "-wal", "-journal"]) {
+    const path = `${dbPath}${suffix}`;
+    if (existsSync(path)) indexFiles[suffix || "database"] = statSync(path).size;
+  }
+
   const summary = computeSummary(results);
   const timestamp = new Date().toISOString().replace(/[:.]/g, "").slice(0, 15);
 
@@ -349,15 +416,23 @@ export async function runBenchmark(
       node: process.version,
       platform: process.platform,
       arch: process.arch,
-      ...(options.dbPath ? { db_size_bytes: statSync(options.dbPath).size } : {}),
+      ...(Object.keys(indexFiles).length > 0 ? {
+        index_size_bytes: Object.values(indexFiles).reduce((sum, bytes) => sum + bytes, 0),
+        index_files: indexFiles,
+      } : {}),
       peak_rss_bytes: process.resourceUsage().maxRSS * (process.platform === "darwin" ? 1 : 1024),
+      embedding_provider: embeddingIdentity.provider,
+      embedding_identity: embeddingIdentity,
+      embedding_fingerprint: getEmbeddingFingerprint(embeddingModel),
     },
     results,
     summary,
   };
 
   // Output
-  if (options.json) {
+  if (options.quiet) {
+    // Matrix workers consume the object directly and own their output envelope.
+  } else if (options.json) {
     console.log(JSON.stringify(benchResult, null, 2));
   } else {
     console.log("\n" + formatTable(results));

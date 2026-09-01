@@ -34,6 +34,7 @@
     "test:bun": "bun test --timeout 60000 --preload ./src/test-preload.ts",
     "test:unit": "CI=true node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 60000 test/ && CI=true bun test --timeout 60000 --preload ./src/test-preload.ts test/",
     "test:package": "node scripts/package-smoke.mjs",
+    "bench:matrix": "tsx scripts/run-model-benchmark.ts --manifest bench/model-matrix.json",
     "qmd": "tsx src/cli/qmd.ts",
     "index": "tsx src/cli/qmd.ts index",
     "vector": "tsx src/cli/qmd.ts vector",
