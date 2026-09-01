@@ -87,6 +87,14 @@ export function isQwen3EmbeddingModel(modelUri: string): boolean {
   return /qwen.*embed/i.test(modelUri) || /embed.*qwen/i.test(modelUri);
 }
 
+export function isGteModernBertModel(modelUri: string): boolean {
+  return /gte[-_/].*modernbert|modernbert.*gte/i.test(modelUri);
+}
+
+export function isBgeEmbeddingModel(modelUri: string): boolean {
+  return /(?:^|[/_-])bge(?:[/_.-]|$)/i.test(modelUri);
+}
+
 function renderEmbeddingPrompt(template: string, text: string, title?: string): string {
   const hasPlaceholder = /\{\{(?:text|query|title)\}\}/.test(template);
   const rendered = template
@@ -96,23 +104,30 @@ function renderEmbeddingPrompt(template: string, text: string, title?: string): 
   return hasPlaceholder ? rendered : `${rendered}${text}`;
 }
 
-/** Format a query using configured preprocessing or the model's default contract. */
+/** Format a query according to the selected encoder's published retrieval contract. */
 export function formatQueryForEmbedding(query: string, modelUri?: string): string {
   const configuredPrompt = embeddingConfig.identity?.queryPrompt;
   if (configuredPrompt !== undefined) return renderEmbeddingPrompt(configuredPrompt, query);
+
   const uri = modelUri ?? resolveEmbedModel();
   if (isQwen3EmbeddingModel(uri)) {
     return `Instruct: Retrieve relevant documents for the given query\nQuery: ${query}`;
   }
+  if (isGteModernBertModel(uri)) return query;
+  if (isBgeEmbeddingModel(uri)) {
+    return `Represent this sentence for searching relevant passages: ${query}`;
+  }
+  // Preserve EmbeddingGemma's existing asymmetric contract.
   return `task: search result | query: ${query}`;
 }
 
-/** Format a document using configured preprocessing or the model's default contract. */
+/** Format a document according to the selected encoder's retrieval contract. */
 export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
   const configuredPrompt = embeddingConfig.identity?.documentPrompt;
   if (configuredPrompt !== undefined) return renderEmbeddingPrompt(configuredPrompt, text, title);
+
   const uri = modelUri ?? resolveEmbedModel();
-  if (isQwen3EmbeddingModel(uri)) {
+  if (isQwen3EmbeddingModel(uri) || isGteModernBertModel(uri) || isBgeEmbeddingModel(uri)) {
     return title ? `${title}\n${text}` : text;
   }
   return `title: ${title || "none"} | text: ${text}`;
@@ -255,6 +270,12 @@ export type RerankDocument = {
 // Format: hf:<user>/<repo>/<file>
 // Override via QMD_EMBED_MODEL env var (e.g. hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf)
 const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+export const CPU_EMBED_MODEL_PRESETS = {
+  "quality-cpu": "hf:cstr/gte-modernbert-base-GGUF/gte-modernbert-base-q8_0.gguf",
+  "fast-cpu": "hf:ggml-org/bge-small-en-v1.5-Q8_0-GGUF/bge-small-en-v1.5-q8_0.gguf",
+  embeddinggemma: DEFAULT_EMBED_MODEL,
+} as const;
+export type CpuEmbedPreset = keyof typeof CPU_EMBED_MODEL_PRESETS;
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
 // const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
@@ -276,7 +297,11 @@ export type ModelResolutionConfig = {
 };
 
 export function resolveEmbedModel(config?: ModelResolutionConfig): string {
-  return config?.embed || process.env.QMD_EMBED_MODEL || DEFAULT_EMBED_MODEL;
+  const preset = process.env.QMD_EMBED_PRESET as CpuEmbedPreset | undefined;
+  if (preset && !CPU_EMBED_MODEL_PRESETS[preset]) {
+    throw new Error(`Unknown QMD_EMBED_PRESET '${preset}'. Expected: ${Object.keys(CPU_EMBED_MODEL_PRESETS).join(", ")}`);
+  }
+  return config?.embed || process.env.QMD_EMBED_MODEL || (preset ? CPU_EMBED_MODEL_PRESETS[preset] : DEFAULT_EMBED_MODEL);
 }
 
 export function resolveGenerateModel(config?: ModelResolutionConfig): string {

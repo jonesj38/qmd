@@ -37,6 +37,10 @@ type ScoreMetrics = {
   recall_at_1: number;
   recall_at_3: number;
   recall_at_5: number;
+  recall_at_10: number;
+  recall_at_40: number;
+  recall_at_100: number;
+  ndcg_at_10: number;
   mrr: number;
   f1: number;
   hits_at_k: number;
@@ -92,6 +96,16 @@ export function scoreResults(
   const recall_at_1 = expectedFiles.length > 0 ? hitsWithin(resultFiles, expectedFiles, 1) / expectedFiles.length : 0;
   const recall_at_3 = expectedFiles.length > 0 ? hitsWithin(resultFiles, expectedFiles, 3) / expectedFiles.length : 0;
   const recall_at_5 = expectedFiles.length > 0 ? hitsWithin(resultFiles, expectedFiles, 5) / expectedFiles.length : 0;
+  const recall_at_10 = expectedFiles.length > 0 ? hitsWithin(resultFiles, expectedFiles, 10) / expectedFiles.length : 0;
+  const recall_at_40 = expectedFiles.length > 0 ? hitsWithin(resultFiles, expectedFiles, 40) / expectedFiles.length : 0;
+  const recall_at_100 = expectedFiles.length > 0 ? hitsWithin(resultFiles, expectedFiles, 100) / expectedFiles.length : 0;
+  let dcg10 = 0;
+  for (let i = 0; i < Math.min(10, resultFiles.length); i++) {
+    if (expectedFiles.some(e => pathsMatch(resultFiles[i]!, e))) dcg10 += 1 / Math.log2(i + 2);
+  }
+  let idealDcg10 = 0;
+  for (let i = 0; i < Math.min(10, expectedFiles.length); i++) idealDcg10 += 1 / Math.log2(i + 2);
+  const ndcg_at_10 = idealDcg10 > 0 ? dcg10 / idealDcg10 : 0;
   const f1 = precision_at_k + recall > 0
     ? 2 * (precision_at_k * recall) / (precision_at_k + recall)
     : 0;
@@ -102,6 +116,10 @@ export function scoreResults(
     recall_at_1,
     recall_at_3,
     recall_at_5,
+    recall_at_10,
+    recall_at_40,
+    recall_at_100,
+    ndcg_at_10,
     mrr,
     f1,
     hits_at_k: hitsAtK,

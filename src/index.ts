@@ -163,6 +163,9 @@ export interface SearchOptions {
   candidateLimit?: number;
   /** Minimum score threshold */
   minScore?: number;
+  /** Opt into bounded weak-evidence candidate/rerank expansion (max 100 by default). */
+  adaptive?: boolean;
+  adaptiveMaxCandidates?: number;
   /** Include explain traces */
   explain?: boolean;
   /** Chunk strategy: "auto" (default, uses AST for code files) or "regex" (legacy) */
@@ -464,6 +467,8 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
           intent: opts.intent,
           candidateLimit: opts.candidateLimit,
           skipRerank,
+          adaptive: opts.adaptive,
+          adaptiveMaxCandidates: opts.adaptiveMaxCandidates,
           chunkStrategy: opts.chunkStrategy,
         });
       }
@@ -477,6 +482,8 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         intent: opts.intent,
         candidateLimit: opts.candidateLimit,
         skipRerank,
+        adaptive: opts.adaptive,
+        adaptiveMaxCandidates: opts.adaptiveMaxCandidates,
         chunkStrategy: opts.chunkStrategy,
       });
     },

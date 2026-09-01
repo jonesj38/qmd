@@ -14,8 +14,9 @@
  *   - full: Full hybrid pipeline with LLM reranking
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
+import { createHash } from "node:crypto";
 import {
   createStore,
   getDefaultDbPath,
@@ -147,8 +148,8 @@ const BACKENDS: Backend[] = [
     run: async (store, query, limit, collection) => {
       const structured = parseStructuredQuery(query.query);
       const results = structured
-        ? await store.search({ queries: structured.searches, intent: structured.intent, limit, collection, rerank: false })
-        : await store.search({ query: query.query, limit, collection, rerank: false });
+        ? await store.search({ queries: structured.searches, intent: structured.intent, limit, candidateLimit: limit, collection, rerank: false })
+        : await store.search({ query: query.query, limit, candidateLimit: limit, collection, rerank: false });
       return results.map((r: HybridQueryResult) => r.file);
     },
   },
@@ -157,8 +158,8 @@ const BACKENDS: Backend[] = [
     run: async (store, query, limit, collection) => {
       const structured = parseStructuredQuery(query.query);
       const results = structured
-        ? await store.search({ queries: structured.searches, intent: structured.intent, limit, collection, rerank: true })
-        : await store.search({ query: query.query, limit, collection, rerank: true });
+        ? await store.search({ queries: structured.searches, intent: structured.intent, limit, candidateLimit: 40, adaptive: true, adaptiveMaxCandidates: limit, collection, rerank: true })
+        : await store.search({ query: query.query, limit, candidateLimit: 40, adaptive: true, adaptiveMaxCandidates: limit, collection, rerank: true });
       return results.map((r: HybridQueryResult) => r.file);
     },
   },
@@ -170,7 +171,8 @@ async function runQuery(
   query: BenchmarkQuery,
   collection?: string,
 ): Promise<BackendResult> {
-  const limit = Math.max(query.expected_in_top_k, 10);
+  // Always retrieve the frozen cutoffs so Recall@10/40/100 is comparable.
+  const limit = Math.max(query.expected_in_top_k, 100);
   const start = Date.now();
 
   let resultFiles: string[];
@@ -184,6 +186,10 @@ async function runQuery(
       recall_at_1: 0,
       recall_at_3: 0,
       recall_at_5: 0,
+      recall_at_10: 0,
+      recall_at_40: 0,
+      recall_at_100: 0,
+      ndcg_at_10: 0,
       mrr: 0,
       f1: 0,
       hits_at_k: 0,
@@ -240,7 +246,7 @@ function computeSummary(results: QueryResult[]): BenchmarkResult["summary"] {
   }
 
   for (const name of Array.from(backendNames)) {
-    let totalP = 0, totalR = 0, totalR1 = 0, totalR3 = 0, totalR5 = 0, totalMrr = 0, totalF1 = 0, totalLat = 0, count = 0;
+    let totalP = 0, totalR = 0, totalR1 = 0, totalR3 = 0, totalR5 = 0, totalR10 = 0, totalR40 = 0, totalR100 = 0, totalNdcg10 = 0, totalMrr = 0, totalF1 = 0, totalLat = 0, count = 0;
     for (const r of results) {
       const br = r.backends[name];
       if (!br) continue;
@@ -249,6 +255,10 @@ function computeSummary(results: QueryResult[]): BenchmarkResult["summary"] {
       totalR1 += br.recall_at_1;
       totalR3 += br.recall_at_3;
       totalR5 += br.recall_at_5;
+      totalR10 += br.recall_at_10;
+      totalR40 += br.recall_at_40;
+      totalR100 += br.recall_at_100;
+      totalNdcg10 += br.ndcg_at_10;
       totalMrr += br.mrr;
       totalF1 += br.f1;
       totalLat += br.latency_ms;
@@ -261,9 +271,14 @@ function computeSummary(results: QueryResult[]): BenchmarkResult["summary"] {
         avg_recall_at_1: totalR1 / count,
         avg_recall_at_3: totalR3 / count,
         avg_recall_at_5: totalR5 / count,
+        avg_recall_at_10: totalR10 / count,
+        avg_recall_at_40: totalR40 / count,
+        avg_recall_at_100: totalR100 / count,
+        avg_ndcg_at_10: totalNdcg10 / count,
         avg_mrr: totalMrr / count,
         avg_f1: totalF1 / count,
         avg_latency_ms: totalLat / count,
+        throughput_queries_per_second: totalLat > 0 ? count * 1000 / totalLat : 0,
       };
     }
   }
@@ -276,7 +291,9 @@ export async function runBenchmark(
   options: { json?: boolean; collection?: string; backends?: string[]; dbPath?: string; configPath?: string } = {},
 ): Promise<BenchmarkResult> {
   // Load fixture
-  const raw = readFileSync(resolve(fixturePath), "utf-8");
+  const fixtureBytes = readFileSync(resolve(fixturePath));
+  const raw = fixtureBytes.toString("utf-8");
+  const fixtureSha256 = createHash("sha256").update(fixtureBytes).digest("hex");
   const fixture: BenchmarkFixture = JSON.parse(raw);
 
   if (!fixture.queries || !Array.isArray(fixture.queries)) {
@@ -327,6 +344,14 @@ export async function runBenchmark(
   const benchResult: BenchmarkResult = {
     timestamp,
     fixture: fixturePath,
+    fixture_sha256: fixtureSha256,
+    environment: {
+      node: process.version,
+      platform: process.platform,
+      arch: process.arch,
+      ...(options.dbPath ? { db_size_bytes: statSync(options.dbPath).size } : {}),
+      peak_rss_bytes: process.resourceUsage().maxRSS * (process.platform === "darwin" ? 1 : 1024),
+    },
     results,
     summary,
   };
@@ -342,7 +367,7 @@ export async function runBenchmark(
     const num = (n: number) => n.toFixed(3).padStart(6);
     for (const [name, s] of Object.entries(summary)) {
       console.log(
-        `  ${pad(name, 8)} P@k=${num(s.avg_precision)} R@1=${num(s.avg_recall_at_1)} R@3=${num(s.avg_recall_at_3)} R@5=${num(s.avg_recall_at_5)} MRR=${num(s.avg_mrr)} F1=${num(s.avg_f1)} Avg=${Math.round(s.avg_latency_ms)}ms`
+        `  ${pad(name, 8)} P@k=${num(s.avg_precision)} R@1=${num(s.avg_recall_at_1)} R@3=${num(s.avg_recall_at_3)} R@10=${num(s.avg_recall_at_10)} R@40=${num(s.avg_recall_at_40)} R@100=${num(s.avg_recall_at_100)} nDCG@10=${num(s.avg_ndcg_at_10)} MRR=${num(s.avg_mrr)} F1=${num(s.avg_f1)} Avg=${Math.round(s.avg_latency_ms)}ms`
       );
     }
   }

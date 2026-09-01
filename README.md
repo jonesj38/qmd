@@ -548,13 +548,25 @@ export QMD_EMBED_MODEL="hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q
 qmd embed -f
 ```
 
-Supported model families:
-- **embeddinggemma** (default) — English-optimized, small footprint
-- **Qwen3-Embedding** — Multilingual (119 languages including CJK), MTEB top-ranked
+Supported local paths:
+- **EmbeddingGemma** (default) — preserves QMD's existing asymmetric prompts.
+- **gte-modernbert-base** — opt-in quality-oriented CPU preset (~532 MB Q8 GGUF).
+- **bge-small-en-v1.5** — opt-in fast 384d CPU baseline.
+- **Qwen3-Embedding** — existing multilingual control; not selected automatically.
 
-> **Note:** When switching embedding models, you must re-index with `qmd embed -f`
-> since vectors are not cross-compatible between models. The prompt format is
-> automatically adjusted for each model family.
+```sh
+QMD_EMBED_PRESET=quality-cpu qmd pull   # gte-modernbert-base Q8
+QMD_EMBED_PRESET=fast-cpu qmd pull      # bge-small-en-v1.5 Q8
+QMD_EMBED_PRESET=embeddinggemma qmd pull
+```
+
+Presets only select a model; they do not download models during tests or benchmarks.
+Runtime support still depends on the installed node-llama-cpp/GGUF backend. After
+changing any embedding compatibility factor, run `qmd embed -f`. QMD now fingerprints
+provider/backend, model reference and revision, artifact/quantization, pooling,
+normalization, dimensions, tokenizer identity/revision, exact query/document prompt
+renderings, and chunking parameters. Search hydration rejects vectors whose model or
+fingerprint is not current, including during incremental migrations.
 
 ### OpenAI Embeddings (Optional)
 
@@ -567,6 +579,7 @@ embedding:
   openai:
     api_key: sk-...  # Optional, falls back to QMD_OPENAI_API_KEY or OPENAI_API_KEY env var
     model: text-embedding-3-small  # Optional, this is the default
+    dimensions: 1536              # Optional API dimensions control
     expansion_model: gpt-4o-mini  # Optional, model for query expansion/reranking
     base_url: https://api.openai.com/v1  # Optional, for OpenAI-compatible APIs (Ollama, vLLM, etc.)
 ```
@@ -579,6 +592,30 @@ Benefits:
 - **OpenAI-compatible** - works with Ollama, vLLM, Azure, and other compatible APIs via `base_url`
 
 When using OpenAI embeddings, query expansion and reranking use the OpenAI API instead of local models.
+
+For mutable aliases or custom OpenAI-compatible services, declare compatibility metadata explicitly:
+
+```yaml
+embedding:
+  provider: openai
+  identity:
+    backend: openai-compatible-v1
+    revision: deployment-2026-09-01
+    quantization: provider-managed
+    pooling: provider-managed
+    normalization: provider-managed
+    dimensions: 1536
+    tokenizer: cl100k_base
+    tokenizer_revision: tiktoken-1.x
+    query_prompt: "{{query}}"
+    document_prompt: "{{title}}\n{{text}}"
+  openai:
+    model: text-embedding-3-small
+    dimensions: 1536
+```
+
+Changing any field produces a new 128-bit embedding fingerprint. Legacy six-character
+fingerprints remain readable for migration diagnostics but never alias the new schema.
 
 ## Installation
 
@@ -946,7 +983,9 @@ qmd bench src/bench/fixtures/example.json --json
 > qmd bench my-fixture.json -c my-collection
 > ```
 
-Each query runs against four backends, reporting precision@k, recall, MRR, and F1:
+Each query runs against four backends. JSON output records the exact fixture SHA-256,
+Recall@10/40/100, MRR, binary nDCG@10, latency, aggregate throughput, database size
+(when an explicit DB path is used), and peak process RSS:
 
 | Backend | What it tests | LLM required |
 |---------|---------------|--------------|
@@ -955,10 +994,16 @@ Each query runs against four backends, reporting precision@k, recall, MRR, and F
 | `hybrid` | BM25 + vector fusion (no reranking) | Embedding model |
 | `full` | Full pipeline with LLM reranking | All three models |
 
-**Score interpretation:** `1.00` = perfect (all expected docs in top results),
-`0.00` = complete miss. The example fixture typically shows bm25 ~0.50, vector
-~0.70, and hybrid/full ~1.00 — a concrete demonstration of why hybrid search beats
-either backend alone.
+The SDK also exposes opt-in bounded adaptation (`adaptive: true`,
+`adaptiveMaxCandidates`, default hard ceiling 100). It expands the candidate/rerank
+set by at most 2x only when explicit weak-evidence signals fire: insufficient
+candidates, a single retrieval signal, low cross-signal agreement, or a flat score
+head. It does not run an unbounded recursive search loop.
+
+**Score interpretation:** `1.00` = perfect and `0.00` = complete miss. Do not
+compare runs unless `fixture_sha256`, corpus/index state, embedding identity, and host
+conditions are controlled. The example is a harness fixture, not a published quality
+claim; QMD does not claim model or pipeline parity without measured frozen runs.
 
 **Custom fixtures** are JSON:
 

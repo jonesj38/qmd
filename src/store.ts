@@ -5453,6 +5453,9 @@ export interface HybridQueryOptions {
   explain?: boolean;        // include backend/RRF/rerank score traces
   intent?: string;          // domain intent hint for disambiguation
   skipRerank?: boolean;     // skip LLM reranking, use only RRF scores
+  /** Opt-in bounded candidate/rerank expansion on explicit weak-evidence signals. */
+  adaptive?: boolean;
+  adaptiveMaxCandidates?: number;
   chunkStrategy?: ChunkStrategy;
   hooks?: SearchHooks;
 }
@@ -5489,6 +5492,50 @@ export type RankedListMeta = {
  */
 export function getHybridRrfWeights(rankedListMeta: RankedListMeta[]): number[] {
   return rankedListMeta.map(meta => meta.queryType === "original" ? 2.0 : 1.0);
+}
+
+export type AdaptiveRetrievalDecision = {
+  weak: boolean;
+  signals: string[];
+  candidateLimit: number;
+};
+
+/**
+ * Bounded candidate expansion based only on observable retrieval evidence.
+ * It never expands more than 2x or beyond maxCandidates, avoiding unbounded
+ * "deep search" loops and making benchmark behavior reproducible.
+ */
+export function planAdaptiveRetrieval(
+  rankedLists: RankedResult[][],
+  fused: RankedResult[],
+  baseCandidates: number,
+  requestedResults: number,
+  maxCandidates: number = 100,
+): AdaptiveRetrievalDecision {
+  const signals: string[] = [];
+  if (fused.length < requestedResults) signals.push("insufficient-candidates");
+  if (rankedLists.length < 2) signals.push("single-retrieval-signal");
+  const topSets = rankedLists.map(list => new Set(list.slice(0, 10).map(item => item.file)));
+  const crossSignalHits = fused.slice(0, 10).filter(item =>
+    topSets.filter(set => set.has(item.file)).length >= 2
+  ).length;
+  if (rankedLists.length >= 2 && crossSignalHits < Math.min(3, requestedResults)) {
+    signals.push("low-cross-signal-agreement");
+  }
+  const first = fused[0]?.score ?? 0;
+  const fifth = fused[Math.min(4, fused.length - 1)]?.score ?? first;
+  if (fused.length >= 5 && first > 0 && (first - fifth) / first < 0.08) signals.push("flat-score-head");
+
+  const weak = signals.length > 0;
+  const base = Math.max(1, baseCandidates, requestedResults);
+  const ceiling = Math.max(base, maxCandidates);
+  return {
+    weak,
+    signals,
+    candidateLimit: weak
+      ? Math.min(fused.length, ceiling, base * 2)
+      : Math.min(fused.length, base),
+  };
 }
 
 /**
@@ -5656,7 +5703,10 @@ export async function hybridQuery(
   const weights = getHybridRrfWeights(rankedListMeta);
   const fused = reciprocalRankFusion(rankedLists, weights);
   const rrfTraceByFile = explain ? buildRrfTrace(rankedLists, weights, rankedListMeta) : null;
-  const candidates = fused.slice(0, candidateLimit);
+  const adaptiveDecision = options?.adaptive
+    ? planAdaptiveRetrieval(rankedLists, fused, candidateLimit, limit, options.adaptiveMaxCandidates)
+    : { candidateLimit, weak: false, signals: [] as string[] };
+  const candidates = fused.slice(0, adaptiveDecision.candidateLimit);
 
   if (candidates.length === 0) return [];
 
@@ -5759,7 +5809,7 @@ export async function hybridQuery(
   const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
 
   const blended = reranked.map(r => {
-    const rrfRank = rrfRankMap.get(r.file) || candidateLimit;
+    const rrfRank = rrfRankMap.get(r.file) || adaptiveDecision.candidateLimit;
     let rrfWeight: number;
     if (rrfRank <= 3) rrfWeight = 0.75;
     else if (rrfRank <= 10) rrfWeight = 0.60;
@@ -5946,6 +5996,9 @@ export interface StructuredSearchOptions {
   intent?: string;
   /** Skip LLM reranking, use only RRF scores */
   skipRerank?: boolean;
+  /** Opt-in bounded candidate/rerank expansion on explicit weak-evidence signals. */
+  adaptive?: boolean;
+  adaptiveMaxCandidates?: number;
   chunkStrategy?: ChunkStrategy;
   hooks?: SearchHooks;
 }
@@ -6087,7 +6140,10 @@ export async function structuredSearch(
   const weights = rankedLists.map((_, i) => i === 0 ? 2.0 : 1.0);
   const fused = reciprocalRankFusion(rankedLists, weights);
   const rrfTraceByFile = explain ? buildRrfTrace(rankedLists, weights, rankedListMeta) : null;
-  const candidates = fused.slice(0, candidateLimit);
+  const adaptiveDecision = options?.adaptive
+    ? planAdaptiveRetrieval(rankedLists, fused, candidateLimit, limit, options.adaptiveMaxCandidates)
+    : { candidateLimit, weak: false, signals: [] as string[] };
+  const candidates = fused.slice(0, adaptiveDecision.candidateLimit);
 
   if (candidates.length === 0) return [];
 
@@ -6194,7 +6250,7 @@ export async function structuredSearch(
   const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
 
   const blended = reranked.map(r => {
-    const rrfRank = rrfRankMap.get(r.file) || candidateLimit;
+    const rrfRank = rrfRankMap.get(r.file) || adaptiveDecision.candidateLimit;
     let rrfWeight: number;
     if (rrfRank <= 3) rrfWeight = 0.75;
     else if (rrfRank <= 10) rrfWeight = 0.60;

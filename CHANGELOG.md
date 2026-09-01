@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Add embedding identity v2 with model/fingerprint-safe vector hydration, opt-in CPU encoder presets, frozen retrieval benchmark metrics, and bounded adaptive candidate expansion.
+
 ### Documentation
 
 - README: documented collection filtering (`-c` semantics), the `collection

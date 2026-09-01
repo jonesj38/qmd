@@ -43,6 +43,11 @@ export interface BackendResult {
   recall_at_3: number;
   /** Fraction of expected files found in the top 5 results */
   recall_at_5: number;
+  recall_at_10: number;
+  recall_at_40: number;
+  recall_at_100: number;
+  /** Binary-relevance normalized discounted cumulative gain at 10. */
+  ndcg_at_10: number;
   /** Reciprocal rank of first relevant result (1/rank, 0 if not found) */
   mrr: number;
   /** Harmonic mean of precision_at_k and recall */
@@ -71,6 +76,15 @@ export interface QueryResult {
 export interface BenchmarkResult {
   timestamp: string;
   fixture: string;
+  /** SHA-256 of exact fixture bytes: freezes relevance input for comparisons. */
+  fixture_sha256: string;
+  environment: {
+    node: string;
+    platform: string;
+    arch: string;
+    db_size_bytes?: number;
+    peak_rss_bytes: number;
+  };
   results: QueryResult[];
   summary: Record<string, {
     avg_precision: number;
@@ -78,8 +92,13 @@ export interface BenchmarkResult {
     avg_recall_at_1: number;
     avg_recall_at_3: number;
     avg_recall_at_5: number;
+    avg_recall_at_10: number;
+    avg_recall_at_40: number;
+    avg_recall_at_100: number;
+    avg_ndcg_at_10: number;
     avg_mrr: number;
     avg_f1: number;
     avg_latency_ms: number;
+    throughput_queries_per_second: number;
   }>;
 }

@@ -111,6 +111,11 @@ describe("scoreResults", () => {
     expect(result.recall_at_5).toBeCloseTo(2 / 3);
     expect(result.matched_files).toEqual(["concepts/a.md", "b.md"]);
     expect(result.unmatched_expected_files).toEqual(["missing.md"]);
+    expect(result.recall_at_10).toBeCloseTo(2 / 3);
+    expect(result.recall_at_40).toBeCloseTo(2 / 3);
+    expect(result.recall_at_100).toBeCloseTo(2 / 3);
+    expect(result.ndcg_at_10).toBeGreaterThan(0);
+    expect(result.ndcg_at_10).toBeLessThan(1);
   });
 
   test("empty results", () => {

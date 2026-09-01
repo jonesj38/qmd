@@ -28,6 +28,7 @@ import {
   formatDocForEmbedding,
   getEmbeddingFingerprint,
   getEmbeddingIdentity,
+  planAdaptiveRetrieval,
   chunkDocument,
   chunkDocumentByTokens,
   chunkDocumentAsync,
@@ -4726,5 +4727,16 @@ describe("isDocid", () => {
 
   test("rejects paths that look like hex with extensions", () => {
     expect(isDocid("abc123.md")).toBe(false);
+  });
+});
+
+
+describe("adaptive retrieval planning", () => {
+  test("expands weak evidence once within a hard bound", () => {
+    const list = Array.from({ length: 80 }, (_, i) => ({ file: `f${i}`, displayPath: `f${i}`, title: "", body: "", score: 1 / (i + 1) }));
+    const decision = planAdaptiveRetrieval([list], list, 40, 10, 60);
+    expect(decision.weak).toBe(true);
+    expect(decision.signals).toContain("single-retrieval-signal");
+    expect(decision.candidateLimit).toBe(60);
   });
 });

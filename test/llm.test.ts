@@ -18,6 +18,8 @@ import {
   resolveParallelismOverride,
   resolveSafeParallelism,
   resolveEmbedModel,
+  formatQueryForEmbedding,
+  formatDocForEmbedding,
   resolveGenerateModel,
   resolveRerankModel,
   resolveModels,
@@ -27,6 +29,20 @@ import {
   type RerankDocument,
   type ILLMSession,
 } from "../src/llm.js";
+
+describe("embedding model contracts", () => {
+  test("gte-modernbert uses prefix-free query and document text", () => {
+    const model = "hf:cstr/gte-modernbert-base-GGUF/gte-modernbert-base-q8_0.gguf";
+    expect(formatQueryForEmbedding("find auth", model)).toBe("find auth");
+    expect(formatDocForEmbedding("body", "Title", model)).toBe("Title\nbody");
+  });
+
+  test("bge small uses its retrieval query instruction and raw documents", () => {
+    const model = "hf:ggml-org/bge-small-en-v1.5-Q8_0-GGUF/bge-small-en-v1.5-q8_0.gguf";
+    expect(formatQueryForEmbedding("find auth", model)).toBe("Represent this sentence for searching relevant passages: find auth");
+    expect(formatDocForEmbedding("body", undefined, model)).toBe("body");
+  });
+});
 
 describe("model name resolution", () => {
   function withModelEnv(env: Record<string, string | undefined>, fn: () => void): void {
