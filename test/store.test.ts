@@ -4739,4 +4739,22 @@ describe("adaptive retrieval planning", () => {
     expect(decision.signals).toContain("single-retrieval-signal");
     expect(decision.candidateLimit).toBe(60);
   });
+
+  test("does not expand when independent signals agree on a strong head", () => {
+    const fused = Array.from({ length: 12 }, (_, i) => ({
+      file: `f${i}`,
+      displayPath: `f${i}`,
+      title: "",
+      body: "",
+      score: i === 0 ? 1 : 0.5 / i,
+    }));
+    const decision = planAdaptiveRetrieval([fused, [...fused]], fused, 5, 5, 20);
+    expect(decision).toEqual({ weak: false, signals: [], candidateLimit: 5 });
+  });
+
+  test("never expands beyond two times the base or the configured ceiling", () => {
+    const list = Array.from({ length: 200 }, (_, i) => ({ file: `f${i}`, displayPath: `f${i}`, title: "", body: "", score: 1 }));
+    expect(planAdaptiveRetrieval([list], list, 40, 10, 100).candidateLimit).toBe(80);
+    expect(planAdaptiveRetrieval([list], list, 40, 10, 55).candidateLimit).toBe(55);
+  });
 });
