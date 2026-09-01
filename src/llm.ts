@@ -87,12 +87,19 @@ export function isQwen3EmbeddingModel(modelUri: string): boolean {
   return /qwen.*embed/i.test(modelUri) || /embed.*qwen/i.test(modelUri);
 }
 
-/**
- * Format a query for embedding.
- * Uses nomic-style task prefix format for embeddinggemma (default).
- * Uses Qwen3-Embedding instruct format when a Qwen embedding model is active.
- */
+function renderEmbeddingPrompt(template: string, text: string, title?: string): string {
+  const hasPlaceholder = /\{\{(?:text|query|title)\}\}/.test(template);
+  const rendered = template
+    .replaceAll("{{text}}", text)
+    .replaceAll("{{query}}", text)
+    .replaceAll("{{title}}", title ?? "none");
+  return hasPlaceholder ? rendered : `${rendered}${text}`;
+}
+
+/** Format a query using configured preprocessing or the model's default contract. */
 export function formatQueryForEmbedding(query: string, modelUri?: string): string {
+  const configuredPrompt = embeddingConfig.identity?.queryPrompt;
+  if (configuredPrompt !== undefined) return renderEmbeddingPrompt(configuredPrompt, query);
   const uri = modelUri ?? resolveEmbedModel();
   if (isQwen3EmbeddingModel(uri)) {
     return `Instruct: Retrieve relevant documents for the given query\nQuery: ${query}`;
@@ -100,15 +107,12 @@ export function formatQueryForEmbedding(query: string, modelUri?: string): strin
   return `task: search result | query: ${query}`;
 }
 
-/**
- * Format a document for embedding.
- * Uses nomic-style format with title and text fields (default).
- * Qwen3-Embedding encodes documents as raw text without special prefixes.
- */
+/** Format a document using configured preprocessing or the model's default contract. */
 export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
+  const configuredPrompt = embeddingConfig.identity?.documentPrompt;
+  if (configuredPrompt !== undefined) return renderEmbeddingPrompt(configuredPrompt, text, title);
   const uri = modelUri ?? resolveEmbedModel();
   if (isQwen3EmbeddingModel(uri)) {
-    // Qwen3-Embedding: documents are raw text, no task prefix
     return title ? `${title}\n${text}` : text;
   }
   return `title: ${title || "none"} | text: ${text}`;
@@ -2141,9 +2145,28 @@ import { OpenAIEmbedding, type OpenAIConfig } from "./openai-llm.js";
  */
 export type EmbeddingProvider = 'local' | 'openai';
 
+export type EmbeddingIdentityOverrides = {
+  /** Stable backend implementation/version, excluding credentials and host-local paths. */
+  backend?: string;
+  /** Immutable upstream commit or service model revision. */
+  revision?: string;
+  /** Stable artifact name or digest. */
+  artifact?: string;
+  quantization?: string;
+  pooling?: string;
+  normalization?: string;
+  dimensions?: number;
+  tokenizer?: string;
+  tokenizerRevision?: string;
+  /** Templates support {{query}}/{{text}} and {{title}}; without placeholders they are prefixes. */
+  queryPrompt?: string;
+  documentPrompt?: string;
+};
+
 export type EmbeddingConfig = {
   provider: EmbeddingProvider;
   openai?: OpenAIConfig;
+  identity?: EmbeddingIdentityOverrides;
 };
 
 // Default embedding config: use local llama-cpp

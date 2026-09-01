@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
 import * as llmModule from "../src/llm.js";
-import { disposeDefaultLlamaCpp, getDefaultEmbeddingLLM, setDefaultLlamaCpp, setEmbeddingConfig } from "../src/llm.js";
+import { disposeDefaultLlamaCpp, getDefaultEmbeddingLLM, getEmbeddingConfig, setDefaultLlamaCpp, setEmbeddingConfig } from "../src/llm.js";
 import {
   createStore,
   verifySqliteVecLoaded,
@@ -27,6 +27,7 @@ import {
   formatQueryForEmbedding,
   formatDocForEmbedding,
   getEmbeddingFingerprint,
+  getEmbeddingIdentity,
   chunkDocument,
   chunkDocumentByTokens,
   chunkDocumentAsync,
@@ -2574,9 +2575,43 @@ describe("Index Status", () => {
     await insertTestDocument(store.db, collectionName, { name: "doc1", hash: "hash1" });
     store.insertEmbedding("hash1", 0, 0, new Float32Array([1, 2, 3]), model, now, 1, "stale1");
 
-    expect(getEmbeddingFingerprint(model)).toMatch(/^[a-f0-9]{6}$/);
+    expect(getEmbeddingFingerprint(model)).toMatch(/^[a-f0-9]{32}$/);
     expect(store.getHashesNeedingEmbedding()).toBe(1);
 
+    await cleanupTestDb(store);
+  });
+
+  test("embedding identity changes across provider and compatibility controls", () => {
+    const previous = getEmbeddingConfig();
+    const model = "hf:test/model-Q8_0.gguf";
+    try {
+      setEmbeddingConfig({ provider: "local", identity: { revision: "commit-a", dimensions: 768 } });
+      const local = getEmbeddingFingerprint(model);
+      const identity = getEmbeddingIdentity(model);
+      expect(identity.provider).toBe("local");
+      expect(identity.model.revision).toBe("commit-a");
+      expect(identity.dimensions).toBe(768);
+      expect(identity.quantization).toBe("Q8_0");
+
+      setEmbeddingConfig({ provider: "local", identity: { revision: "commit-b", dimensions: 768 } });
+      expect(getEmbeddingFingerprint(model)).not.toBe(local);
+      setEmbeddingConfig({ provider: "openai", openai: { embedModel: model, baseURL: "https://example.test/v1" }, identity: { revision: "commit-a", dimensions: 768 } });
+      expect(getEmbeddingFingerprint(model)).not.toBe(local);
+    } finally {
+      setEmbeddingConfig(previous);
+    }
+  });
+
+  test("vector hydration rejects stale embedding fingerprints", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    const model = "hf:test/embed-model-Q8_0.gguf";
+    const now = new Date().toISOString();
+    store.ensureVecTable(3);
+    await insertTestDocument(store.db, collectionName, { name: "doc1", hash: "stalehash" });
+    store.insertEmbedding("stalehash", 0, 0, new Float32Array([1, 0, 0]), model, now, 1, "incompatible");
+
+    expect(store.searchVecBatch([[1, 0, 0]], 10, collectionName, model)[0]).toEqual([]);
     await cleanupTestDb(store);
   });
 
@@ -2958,7 +2993,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
     // Create vector table and insert a vector
     store.ensureVecTable(768);
     const embedding = Array(768).fill(0).map(() => Math.random());
-    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash, new Date().toISOString());
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, embedded_at) VALUES (?, 0, 0, 'embeddinggemma', ?, ?)`).run(hash, getEmbeddingFingerprint("embeddinggemma"), new Date().toISOString());
     store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_0`, new Float32Array(embedding));
 
     const results = await store.searchVec("test query", "embeddinggemma", 10);
@@ -2994,8 +3029,8 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
     store.ensureVecTable(768);
     const embedding1 = Array(768).fill(0).map(() => Math.random());
     const embedding2 = Array(768).fill(0).map(() => Math.random());
-    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash1, new Date().toISOString());
-    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash2, new Date().toISOString());
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, embedded_at) VALUES (?, 0, 0, 'embeddinggemma', ?, ?)`).run(hash1, getEmbeddingFingerprint("embeddinggemma"), new Date().toISOString());
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, embedded_at) VALUES (?, 0, 0, 'embeddinggemma', ?, ?)`).run(hash2, getEmbeddingFingerprint("embeddinggemma"), new Date().toISOString());
     store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash1}_0`, new Float32Array(embedding1));
     store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash2}_0`, new Float32Array(embedding2));
 
@@ -3030,7 +3065,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
     // Create vector table and insert a test vector
     store.ensureVecTable(768);
     const embedding = Array(768).fill(0).map(() => Math.random());
-    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash, new Date().toISOString());
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, embedded_at) VALUES (?, 0, 0, 'embeddinggemma', ?, ?)`).run(hash, getEmbeddingFingerprint("embeddinggemma"), new Date().toISOString());
     store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_0`, new Float32Array(embedding));
 
     // This should complete quickly (not hang) due to the two-step fix

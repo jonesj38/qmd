@@ -32,6 +32,7 @@ import {
   extractTitle,
   formatDocForEmbedding,
   getEmbeddingFingerprint,
+  getEmbeddingIdentity,
   chunkDocumentByTokens,
   clearCache,
   getCacheKey,
@@ -4073,6 +4074,7 @@ async function showDoctor(): Promise<void> {
   const activeModels = resolveModelsForCli();
   const embedModel = activeModels.embed;
   const fingerprint = getEmbeddingFingerprint(embedModel);
+  const identity = getEmbeddingIdentity(embedModel);
   const nextSteps: string[] = [];
 
   console.log(`${c.bold}QMD Doctor${c.reset}\n`);
@@ -4088,6 +4090,11 @@ async function showDoctor(): Promise<void> {
 
   const betterSqliteVersion = pkg.dependencies?.["better-sqlite3"] ?? pkg.devDependencies?.["better-sqlite3"] ?? "not declared";
   doctorCheck("better-sqlite3 package", true, String(betterSqliteVersion));
+  doctorCheck(
+    "embedding identity",
+    true,
+    `${identity.provider}; ${identity.backend}; ${identity.model.reference}@${identity.model.revision}; ${identity.dimensions}d; ${fingerprint}`,
+  );
 
   try {
     const row = db.prepare(`SELECT vec_version() AS version`).get() as { version: string };
@@ -4284,9 +4291,23 @@ if (isMain) {
   if (useOpenAI) {
     setEmbeddingConfig({
       provider: 'openai',
+      identity: embeddingYamlConfig.identity ? {
+        backend: embeddingYamlConfig.identity.backend,
+        revision: embeddingYamlConfig.identity.revision,
+        artifact: embeddingYamlConfig.identity.artifact,
+        quantization: embeddingYamlConfig.identity.quantization,
+        pooling: embeddingYamlConfig.identity.pooling,
+        normalization: embeddingYamlConfig.identity.normalization,
+        dimensions: embeddingYamlConfig.identity.dimensions,
+        tokenizer: embeddingYamlConfig.identity.tokenizer,
+        tokenizerRevision: embeddingYamlConfig.identity.tokenizer_revision,
+        queryPrompt: embeddingYamlConfig.identity.query_prompt,
+        documentPrompt: embeddingYamlConfig.identity.document_prompt,
+      } : undefined,
       openai: {
         apiKey: embeddingYamlConfig.openai?.api_key || process.env.QMD_OPENAI_API_KEY,
         embedModel: embeddingYamlConfig.openai?.model || process.env.QMD_OPENAI_EMBED_MODEL,
+        dimensions: embeddingYamlConfig.openai?.dimensions,
         expansionModel: embeddingYamlConfig.openai?.expansion_model,
         rerankModel: embeddingYamlConfig.openai?.rerank_model,
         baseURL: embeddingYamlConfig.openai?.base_url || process.env.QMD_OPENAI_BASE_URL,
@@ -4295,6 +4316,23 @@ if (isMain) {
         rerankBaseURL: embeddingYamlConfig.openai?.rerank_base_url,
         rerankApiKey: embeddingYamlConfig.openai?.rerank_api_key,
       },
+    });
+  } else {
+    setEmbeddingConfig({
+      provider: 'local',
+      identity: embeddingYamlConfig.identity ? {
+        backend: embeddingYamlConfig.identity.backend,
+        revision: embeddingYamlConfig.identity.revision,
+        artifact: embeddingYamlConfig.identity.artifact,
+        quantization: embeddingYamlConfig.identity.quantization,
+        pooling: embeddingYamlConfig.identity.pooling,
+        normalization: embeddingYamlConfig.identity.normalization,
+        dimensions: embeddingYamlConfig.identity.dimensions,
+        tokenizer: embeddingYamlConfig.identity.tokenizer,
+        tokenizerRevision: embeddingYamlConfig.identity.tokenizer_revision,
+        queryPrompt: embeddingYamlConfig.identity.query_prompt,
+        documentPrompt: embeddingYamlConfig.identity.document_prompt,
+      } : undefined,
     });
   }
 

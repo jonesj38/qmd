@@ -348,9 +348,23 @@ function configureEmbeddingProvider(config?: CollectionConfig): void {
   if (useOpenAI) {
     setEmbeddingConfig({
       provider: 'openai',
+      identity: embeddingYamlConfig.identity ? {
+        backend: embeddingYamlConfig.identity.backend,
+        revision: embeddingYamlConfig.identity.revision,
+        artifact: embeddingYamlConfig.identity.artifact,
+        quantization: embeddingYamlConfig.identity.quantization,
+        pooling: embeddingYamlConfig.identity.pooling,
+        normalization: embeddingYamlConfig.identity.normalization,
+        dimensions: embeddingYamlConfig.identity.dimensions,
+        tokenizer: embeddingYamlConfig.identity.tokenizer,
+        tokenizerRevision: embeddingYamlConfig.identity.tokenizer_revision,
+        queryPrompt: embeddingYamlConfig.identity.query_prompt,
+        documentPrompt: embeddingYamlConfig.identity.document_prompt,
+      } : undefined,
       openai: {
         apiKey: embeddingYamlConfig.openai?.api_key || process.env.QMD_OPENAI_API_KEY,
         embedModel: embeddingYamlConfig.openai?.model || process.env.QMD_OPENAI_EMBED_MODEL,
+        dimensions: embeddingYamlConfig.openai?.dimensions,
         expansionModel: embeddingYamlConfig.openai?.expansion_model,
         rerankModel: embeddingYamlConfig.openai?.rerank_model,
         baseURL: embeddingYamlConfig.openai?.base_url || process.env.QMD_OPENAI_BASE_URL,
@@ -363,7 +377,22 @@ function configureEmbeddingProvider(config?: CollectionConfig): void {
     return;
   }
 
-  setEmbeddingConfig({ provider: 'local' });
+  setEmbeddingConfig({
+    provider: 'local',
+    identity: embeddingYamlConfig.identity ? {
+      backend: embeddingYamlConfig.identity.backend,
+      revision: embeddingYamlConfig.identity.revision,
+      artifact: embeddingYamlConfig.identity.artifact,
+      quantization: embeddingYamlConfig.identity.quantization,
+      pooling: embeddingYamlConfig.identity.pooling,
+      normalization: embeddingYamlConfig.identity.normalization,
+      dimensions: embeddingYamlConfig.identity.dimensions,
+      tokenizer: embeddingYamlConfig.identity.tokenizer,
+      tokenizerRevision: embeddingYamlConfig.identity.tokenizer_revision,
+      queryPrompt: embeddingYamlConfig.identity.query_prompt,
+      documentPrompt: embeddingYamlConfig.identity.document_prompt,
+    } : undefined,
+  });
 }
 
 export async function createStore(options: StoreOptions): Promise<QMDStore> {

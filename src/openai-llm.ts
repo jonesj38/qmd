@@ -31,6 +31,7 @@ export type OpenAIConfig = {
   rerankBaseURL?: string;
   rerankApiKey?: string;
   maxInputTokens?: number;
+  dimensions?: number;
 };
 
 // Lazy tiktoken encoder (cl100k_base covers most OpenAI-compatible models)
@@ -250,6 +251,7 @@ export class OpenAIEmbedding implements LLM {
   private expansionModel: string;
   private rerankModel: string;
   private maxInputTokens: number;
+  private dimensions?: number;
 
   constructor(config: OpenAIConfig = {}) {
     const apiKey = config.apiKey || process.env.QMD_OPENAI_API_KEY || process.env.OPENAI_API_KEY;
@@ -274,6 +276,7 @@ export class OpenAIEmbedding implements LLM {
     this.expansionModel = config.expansionModel || DEFAULT_EXPANSION_MODEL;
     this.rerankModel = config.rerankModel || config.expansionModel || DEFAULT_EXPANSION_MODEL;
     this.maxInputTokens = resolveMaxInputTokens(config.maxInputTokens);
+    this.dimensions = config.dimensions;
   }
 
   async embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
@@ -284,6 +287,7 @@ export class OpenAIEmbedding implements LLM {
           this.client.embeddings.create({
             model: this.embedModel,
             input,
+            ...(this.dimensions ? { dimensions: this.dimensions } : {}),
           }, requestOptions)
         );
         const data = response.data[0];
@@ -305,6 +309,7 @@ export class OpenAIEmbedding implements LLM {
       const response = await this.client.embeddings.create({
         model: this.embedModel,
         input,
+        ...(this.dimensions ? { dimensions: this.dimensions } : {}),
       });
       const data = response.data[0];
       if (!data) {
@@ -329,6 +334,7 @@ export class OpenAIEmbedding implements LLM {
           this.client.embeddings.create({
             model: this.embedModel,
             input: inputs,
+            ...(this.dimensions ? { dimensions: this.dimensions } : {}),
           }, requestOptions)
         );
         return response.data.map(item => ({
@@ -347,6 +353,7 @@ export class OpenAIEmbedding implements LLM {
       const response = await this.client.embeddings.create({
         model: this.embedModel,
         input: inputs,
+        ...(this.dimensions ? { dimensions: this.dimensions } : {}),
       });
       return response.data.map(item => ({
         embedding: item.embedding,

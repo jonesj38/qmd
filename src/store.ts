@@ -25,6 +25,7 @@ import {
   getDefaultLlamaCpp,
   getDefaultEmbeddingLLM,
   isUsingOpenAI,
+  getEmbeddingConfig,
   formatQueryForEmbedding,
   formatDocForEmbedding,
   withLLMSessionForLlm,
@@ -112,15 +113,124 @@ export const CHUNK_OVERLAP_CHARS = CHUNK_OVERLAP_TOKENS * 4;  // 540 chars
 export const CHUNK_WINDOW_TOKENS = 200;
 export const CHUNK_WINDOW_CHARS = CHUNK_WINDOW_TOKENS * 4;  // 800 chars
 
+export type EmbeddingIdentity = {
+  schema: 2;
+  provider: "local" | "openai";
+  backend: string;
+  model: {
+    reference: string;
+    revision: string;
+    artifact: string;
+  };
+  quantization: string;
+  pooling: string;
+  normalization: string;
+  dimensions: number | "model-default";
+  tokenizer: {
+    identity: string;
+    revision: string;
+  };
+  preprocessing: {
+    query: string;
+    document: string;
+    chunking: {
+      strategy: "token-aware-regex-or-ast";
+      sizeTokens: number;
+      overlapTokens: number;
+      breakpointWindowTokens: number;
+    };
+  };
+};
+
+function basenamePortable(value: string): string {
+  return value.split(/[\\/]/).filter(Boolean).at(-1) ?? value;
+}
+
+/** Remove credentials, query strings, and machine-local parent directories. */
+function canonicalizeSemanticReference(value: string): string {
+  const trimmed = value.trim();
+  const backendPrefix = "openai-compatible:";
+  if (trimmed.startsWith(backendPrefix)) {
+    return `${backendPrefix}${canonicalizeSemanticReference(trimmed.slice(backendPrefix.length))}`;
+  }
+  try {
+    const url = new URL(trimmed);
+    if (url.protocol === "file:") return `file:${basenamePortable(decodeURIComponent(url.pathname))}`;
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    url.hostname = url.hostname.toLowerCase();
+    url.pathname = url.pathname.replace(/\/+$/, "");
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    // Model IDs such as hf:owner/repo/file are deliberately not URL-parsed.
+  }
+  if (/^(?:[a-zA-Z]:[\\/]|[\\/])/.test(trimmed)) {
+    return `file:${basenamePortable(trimmed)}`;
+  }
+  return trimmed.replace(/\\/g, "/");
+}
+
+function inferQuantization(model: string): string {
+  return basenamePortable(model).match(/(?:^|[-_.])(f16|f32|q\d(?:_[a-z0-9]+)*|iq\d(?:_[a-z0-9]+)*)(?:[-_.]|$)/i)?.[1]?.toUpperCase() ?? "provider/model-default";
+}
+
+function inferDimensions(model: string, configured?: number): number | "model-default" {
+  if (configured) return configured;
+  if (/text-embedding-3-small/i.test(model)) return 1536;
+  if (/embeddinggemma/i.test(model)) return 768;
+  if (/gte[-_/].*modernbert|modernbert.*gte/i.test(model)) return 768;
+  if (/(?:^|[/_-])bge-small/i.test(model)) return 384;
+  return "model-default";
+}
+
+export function getEmbeddingIdentity(model: string = DEFAULT_EMBED_MODEL): EmbeddingIdentity {
+  const config = getEmbeddingConfig();
+  const overrides = config.identity ?? {};
+  const provider = config.provider;
+  const modelReference = canonicalizeSemanticReference(model);
+  const artifact = canonicalizeSemanticReference(overrides.artifact ?? modelReference);
+  const revision = overrides.revision?.trim() || "unspecified";
+  const defaultBackend = provider === "openai"
+    ? `openai-compatible:${canonicalizeSemanticReference(config.openai?.baseURL ?? "https://api.openai.com/v1")}`
+    : "node-llama-cpp/gguf";
+  return {
+    schema: 2,
+    provider,
+    backend: canonicalizeSemanticReference(overrides.backend ?? defaultBackend),
+    model: {
+      reference: modelReference,
+      revision,
+      artifact,
+    },
+    quantization: overrides.quantization?.trim() || inferQuantization(artifact),
+    pooling: overrides.pooling?.trim() || (provider === "local" ? "gguf-model-metadata" : "provider-managed"),
+    normalization: overrides.normalization?.trim() || (provider === "local" ? "node-llama-cpp-model-default" : "provider-managed"),
+    dimensions: inferDimensions(modelReference, overrides.dimensions ?? config.openai?.dimensions),
+    tokenizer: {
+      identity: overrides.tokenizer?.trim() || (provider === "local" ? "gguf-model-metadata" : "tiktoken:cl100k_base"),
+      revision: overrides.tokenizerRevision?.trim() || (provider === "local" ? revision : "package-managed"),
+    },
+    preprocessing: {
+      // These are the exact probe renderings produced by the active formatter,
+      // so model presets and configured prompt templates share one identity path.
+      query: formatQueryForEmbedding(EMBED_FINGERPRINT_PROBE_QUERY, model),
+      document: formatDocForEmbedding(EMBED_FINGERPRINT_PROBE_DOC, EMBED_FINGERPRINT_PROBE_TITLE, model),
+      chunking: {
+        strategy: "token-aware-regex-or-ast",
+        sizeTokens: CHUNK_SIZE_TOKENS,
+        overlapTokens: CHUNK_OVERLAP_TOKENS,
+        breakpointWindowTokens: CHUNK_WINDOW_TOKENS,
+      },
+    },
+  };
+}
+
 export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): string {
-  const significant = [
-    `model:${model}`,
-    `query:${formatQueryForEmbedding(EMBED_FINGERPRINT_PROBE_QUERY, model)}`,
-    `doc:${formatDocForEmbedding(EMBED_FINGERPRINT_PROBE_DOC, EMBED_FINGERPRINT_PROBE_TITLE, model)}`,
-    `chunk_tokens:${CHUNK_SIZE_TOKENS}`,
-    `chunk_overlap_tokens:${CHUNK_OVERLAP_TOKENS}`,
-  ].join("\n");
-  return createHash("sha256").update(significant).digest("hex").slice(0, 6);
+  // Fixed field order above is the canonical serialization. 128 bits keeps
+  // collision risk negligible; legacy six-hex fingerprints never alias it.
+  return createHash("sha256").update(JSON.stringify(getEmbeddingIdentity(model))).digest("hex").slice(0, 32);
 }
 
 /**
@@ -1202,6 +1312,32 @@ export function isSqliteVecAvailable(): boolean {
   return _sqliteVecAvailable === true;
 }
 
+function getVecTableDimensions(db: Database): number | null {
+  const row = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get() as { sql: string } | undefined;
+  const value = row?.sql.match(/float\[(\d+)\]/)?.[1];
+  return value ? Number.parseInt(value, 10) : null;
+}
+
+function assertEmbeddingDimensions(db: Database, embeddings: ArrayLike<number>[], model: string, operation: string): void {
+  if (embeddings.length === 0) return;
+  const dimensions = embeddings[0]!.length;
+  if (embeddings.some(embedding => embedding.length !== dimensions)) {
+    throw new Error(`${operation} returned inconsistent embedding dimensions`);
+  }
+  const config = getEmbeddingConfig();
+  const configured = config.identity?.dimensions ?? config.openai?.dimensions;
+  if (configured !== undefined && configured !== dimensions) {
+    throw new Error(`${operation} produced ${dimensions}d vectors but the active embedding identity declares ${configured}d`);
+  }
+  const stored = getVecTableDimensions(db);
+  if (stored !== null && stored !== dimensions) {
+    throw new Error(
+      `Embedding dimension mismatch: stored vectors are ${stored}d but ${operation} produced ${dimensions}d. ` +
+      `Run 'qmd embed -f' to re-embed with the active identity.`
+    );
+  }
+}
+
 function ensureVecTableInternal(db: Database, dimensions: number): void {
   if (!_sqliteVecAvailable) {
     throw createSqliteVecUnavailableError(
@@ -1274,7 +1410,7 @@ export type Store = {
   // Search
   searchFTS: (query: string, limit?: number, collections?: string | string[]) => SearchResult[];
   searchVec: (query: string, model: string, limit?: number, collections?: string | string[], session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
-  searchVecBatch: (embeddings: number[][], limit?: number, collections?: string | string[]) => SearchResult[][];
+  searchVecBatch: (embeddings: number[][], limit?: number, collections?: string | string[], model?: string) => SearchResult[][];
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string, intent?: string) => Promise<ExpandedQuery[]>;
@@ -1559,6 +1695,7 @@ async function commitEmbeddingWrites(
   fingerprint: string,
 ): Promise<void> {
   if (writes.length === 0) return;
+  assertEmbeddingDimensions(store.db, writes.map(write => write.embedding), model, "embedding provider");
   await store.withWriteLock("embed:commit", () => {
     withLazyContentVectorMigration(store.db, () => {
       const commit = store.db.transaction(() => {
@@ -2161,7 +2298,7 @@ export function createStore(dbPath?: string, options: CreateStoreOptions = {}): 
     // Search
     searchFTS: (query: string, limit?: number, collections?: string | string[]) => searchFTS(db, query, limit, collections),
     searchVec: (query: string, model: string, limit?: number, collections?: string | string[], session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collections, session, precomputedEmbedding),
-    searchVecBatch: (embeddings: number[][], limit?: number, collections?: string | string[]) => searchVecBatch(db, embeddings, limit, collections),
+    searchVecBatch: (embeddings: number[][], limit?: number, collections?: string | string[], model?: string) => searchVecBatch(db, embeddings, limit, collections, model),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, intent, store.llm),
@@ -2468,6 +2605,11 @@ export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: 
     const result = await session.embed(formatDocForEmbedding(chunk.text, title, model), { model });
     if (!result) {
       return { checked: true, adopted: 0, reason: "failed to embed legacy sample" };
+    }
+    try {
+      assertEmbeddingDimensions(db, [result.embedding], model, "legacy compatibility probe");
+    } catch (error) {
+      return { checked: true, adopted: 0, reason: error instanceof Error ? error.message : String(error) };
     }
 
     const nearest = db.prepare(`
@@ -4094,24 +4236,24 @@ function getGlobalVectorMatches(db: Database, embedding: number[], limit: number
   `).all(new Float32Array(embedding), limit) as VectorMatch[];
 }
 
-function getScopedVectorHashSeqs(db: Database, collections: string[], maxRows: number): string[] {
+function getScopedVectorHashSeqs(db: Database, collections: string[], maxRows: number, model: string, fingerprint: string): string[] {
   const collectionFilter = buildCollectionSql(collections, "d");
   const sql = `
     SELECT cv.hash || '_' || cv.seq as hash_seq
     FROM content_vectors cv
     JOIN documents d ON d.hash = cv.hash AND d.active = 1
-    WHERE 1 = 1
+    WHERE cv.model = ? AND cv.embed_fingerprint = ?
     ${collectionFilter.sql}
     GROUP BY cv.hash, cv.seq
     ORDER BY cv.hash ASC, cv.seq ASC
     LIMIT ?
   `;
   return withLazyContentVectorMigration(db, () => (
-    db.prepare(sql).all(...collectionFilter.params, maxRows) as { hash_seq: string }[]
+    db.prepare(sql).all(model, fingerprint, ...collectionFilter.params, maxRows) as { hash_seq: string }[]
   )).map(row => row.hash_seq);
 }
 
-function getBudgetedScopedVectorHashSeqs(db: Database, collections: string[], exactLimit: number): string[] {
+function getBudgetedScopedVectorHashSeqs(db: Database, collections: string[], exactLimit: number, model: string, fingerprint: string): string[] {
   if (exactLimit <= 0) return [];
   const hashSeqs: string[] = [];
   const seen = new Set<string>();
@@ -4120,7 +4262,7 @@ function getBudgetedScopedVectorHashSeqs(db: Database, collections: string[], ex
     const remaining = exactLimit - hashSeqs.length;
     if (remaining <= 0) break;
 
-    const scoped = getScopedVectorHashSeqs(db, [collection], remaining + 1);
+    const scoped = getScopedVectorHashSeqs(db, [collection], remaining + 1, model, fingerprint);
     if (scoped.length > remaining) {
       // Skip oversized collections rather than letting one large source scope
       // suppress smaller selected collections or trigger an unbounded scan.
@@ -4137,12 +4279,12 @@ function getBudgetedScopedVectorHashSeqs(db: Database, collections: string[], ex
   return hashSeqs;
 }
 
-function getScopedVectorMatches(db: Database, embedding: number[], collections: string[], limit: number): VectorMatch[] {
+function getScopedVectorMatches(db: Database, embedding: number[], collections: string[], limit: number, model: string, fingerprint: string): VectorMatch[] {
   const configuredLimit = getScopedVectorExactLimit();
   const exactLimit = collections.length > 1
     ? Math.min(configuredLimit, MULTI_COLLECTION_SCOPED_VECTOR_EXACT_LIMIT)
     : configuredLimit;
-  const scopedHashSeqs = getBudgetedScopedVectorHashSeqs(db, collections, exactLimit);
+  const scopedHashSeqs = getBudgetedScopedVectorHashSeqs(db, collections, exactLimit, model, fingerprint);
   if (scopedHashSeqs.length === 0) return [];
 
   const matches: VectorMatch[] = [];
@@ -4178,13 +4320,15 @@ function getScopedVectorMatchesBatch(
   embeddings: number[][],
   collections: string[],
   limit: number,
+  model: string,
+  fingerprint: string,
 ): VectorMatch[][] {
   if (embeddings.length === 0) return [];
   const configuredLimit = getScopedVectorExactLimit();
   const exactLimit = collections.length > 1
     ? Math.min(configuredLimit, MULTI_COLLECTION_SCOPED_VECTOR_EXACT_LIMIT)
     : configuredLimit;
-  const scopedHashSeqs = getBudgetedScopedVectorHashSeqs(db, collections, exactLimit);
+  const scopedHashSeqs = getBudgetedScopedVectorHashSeqs(db, collections, exactLimit, model, fingerprint);
   const matches = embeddings.map(() => [] as VectorMatch[]);
   const batchSize = SCOPED_VECTOR_SQL_BATCH_SIZE;
 
@@ -4225,7 +4369,9 @@ type VectorDocRow = {
 function getVectorDocRows(
   db: Database,
   hashSeqs: string[],
-  collections?: string | string[],
+  collections: string | string[] | undefined,
+  model: string,
+  fingerprint: string,
 ): VectorDocRow[] {
   if (hashSeqs.length === 0) return [];
   const wantedHashSeqs = new Set(hashSeqs);
@@ -4248,8 +4394,9 @@ function getVectorDocRows(
     JOIN documents d ON d.hash = cv.hash AND d.active = 1
     JOIN content ON content.hash = d.hash
     WHERE cv.hash IN (${placeholders})
+      AND cv.model = ? AND cv.embed_fingerprint = ?
     ${collectionFilter.sql}
-  `).all(...hashes, ...collectionFilter.params) as VectorDocRow[]);
+  `).all(...hashes, model, fingerprint, ...collectionFilter.params) as VectorDocRow[]);
   // A hash can have multiple chunk sequences. Use the indexed hash lookup in
   // SQL, then restore exact hash_seq semantics over the small hydrated set.
   return rows.filter(row => wantedHashSeqs.has(row.hash_seq));
@@ -4296,8 +4443,8 @@ function hydrateVectorMatchesFromRows(
     });
 }
 
-function hydrateVectorMatches(db: Database, vecResults: VectorMatch[], limit: number, collections?: string | string[]): SearchResult[] {
-  const docRows = getVectorDocRows(db, vecResults.map(result => result.hash_seq), collections);
+function hydrateVectorMatches(db: Database, vecResults: VectorMatch[], limit: number, collections: string | string[] | undefined, model: string, fingerprint: string): SearchResult[] {
+  const docRows = getVectorDocRows(db, vecResults.map(result => result.hash_seq), collections, model, fingerprint);
   return hydrateVectorMatchesFromRows(db, docRows, vecResults, limit);
 }
 
@@ -4307,17 +4454,21 @@ export async function searchVec(db: Database, query: string, model: string, limi
 
   const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session);
   if (!embedding) return [];
+  assertEmbeddingDimensions(db, [embedding], model, "query embedding");
 
   // IMPORTANT: sqlite-vec virtual tables can hang indefinitely when KNN MATCH
   // is combined with JOINs. Keep vector lookup and document hydration separate.
   // See: https://github.com/tobi/qmd/pull/23
   const normalizedCollections = normalizeCollectionFilter(collections);
+  const fingerprint = getEmbeddingFingerprint(model);
   const vecResults = normalizedCollections.length > 0
-    ? getScopedVectorMatches(db, embedding, normalizedCollections, limit)
-    : getGlobalVectorMatches(db, embedding, limit * 3);
+    ? getScopedVectorMatches(db, embedding, normalizedCollections, limit, model, fingerprint)
+    // Over-fetch because stale identities can coexist in vectors_vec while an
+    // incremental re-embed is in progress; hydration below rejects them.
+    : getGlobalVectorMatches(db, embedding, Math.max(limit * 20, 200));
 
   if (vecResults.length === 0) return [];
-  return hydrateVectorMatches(db, vecResults, limit, normalizedCollections);
+  return hydrateVectorMatches(db, vecResults, limit, normalizedCollections, model, fingerprint);
 }
 
 
@@ -4326,21 +4477,24 @@ export function searchVecBatch(
   embeddings: number[][],
   limit: number = 20,
   collections?: string | string[],
+  model: string = DEFAULT_EMBED_MODEL,
 ): SearchResult[][] {
   if (embeddings.length === 0) return [];
   const tableExists = db.prepare(
     `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`,
   ).get();
   if (!tableExists) return embeddings.map(() => []);
+  assertEmbeddingDimensions(db, embeddings, model, "query embeddings");
 
   const normalizedCollections = normalizeCollectionFilter(collections);
+  const fingerprint = getEmbeddingFingerprint(model);
   const matches = normalizedCollections.length > 0
-    ? getScopedVectorMatchesBatch(db, embeddings, normalizedCollections, limit)
-    : embeddings.map(embedding => getGlobalVectorMatches(db, embedding, limit * 3));
+    ? getScopedVectorMatchesBatch(db, embeddings, normalizedCollections, limit, model, fingerprint)
+    : embeddings.map(embedding => getGlobalVectorMatches(db, embedding, Math.max(limit * 20, 200)));
   const allHashSeqs = [...new Set(matches.flatMap(result =>
     result.map(match => match.hash_seq)
   ))];
-  const docRows = getVectorDocRows(db, allHashSeqs, normalizedCollections);
+  const docRows = getVectorDocRows(db, allHashSeqs, normalizedCollections, model, fingerprint);
   return matches.map(result => hydrateVectorMatchesFromRows(
     db, docRows, result, limit,
   ));
@@ -4507,6 +4661,11 @@ function insertEmbeddingUnsafe(
   fingerprint: string,
 ): void {
   const hashSeq = `${hash}_${seq}`;
+  const config = getEmbeddingConfig();
+  const configuredDimensions = config.identity?.dimensions ?? config.openai?.dimensions;
+  if (configuredDimensions !== undefined && configuredDimensions !== embedding.length) {
+    throw new Error(`Embedding write is ${embedding.length}d but the active embedding identity declares ${configuredDimensions}d`);
+  }
   const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embed_fingerprint, total_chunks, embedded_at) VALUES (?, ?, ?, ?, ?, ?, ?)`);
   insertContentVectorStmt.run(hash, seq, pos, model, fingerprint, totalChunks, embeddedAt);
 
@@ -5468,7 +5627,7 @@ export async function hybridQuery(
       const valid = embeddings.map(result => result?.embedding).filter(
         (embedding): embedding is number[] => !!embedding,
       );
-      const vecResultSets = store.searchVecBatch(valid, 20, collection);
+      const vecResultSets = store.searchVecBatch(valid, 20, collection, embedModel);
       let resultIndex = 0;
       for (let i = 0; i < uniqueVecQueries.length; i++) {
         const embedding = embeddings[i]?.embedding;
@@ -5897,7 +6056,7 @@ export async function structuredSearch(
         const valid = embeddings.map(result => result?.embedding).filter(
           (embedding): embedding is number[] => !!embedding,
         );
-        const vecResultSets = store.searchVecBatch(valid, 20, collectionFilter);
+        const vecResultSets = store.searchVecBatch(valid, 20, collectionFilter, modelName);
         let resultIndex = 0;
         for (let i = 0; i < vecSearches.length; i++) {
           const embedding = embeddings[i]?.embedding;

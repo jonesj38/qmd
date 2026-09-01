@@ -47,9 +47,24 @@ export interface ModelsConfig {
  */
 export interface EmbeddingProviderConfig {
   provider?: 'local' | 'openai';  // Default: 'openai' when QMD_OPENAI or an OpenAI key is present, otherwise 'local'
+  /** Values that affect vector compatibility. Declare revision for mutable model/service names. */
+  identity?: {
+    backend?: string;
+    revision?: string;
+    artifact?: string;
+    quantization?: string;
+    pooling?: string;
+    normalization?: string;
+    dimensions?: number;
+    tokenizer?: string;
+    tokenizer_revision?: string;
+    query_prompt?: string;
+    document_prompt?: string;
+  };
   openai?: {
     api_key?: string;             // Falls back to QMD_OPENAI_API_KEY / OPENAI_API_KEY env var
     model?: string;               // Default: 'text-embedding-3-small'
+    dimensions?: number;          // Optional OpenAI dimensions parameter; part of embedding identity
     expansion_model?: string;     // Default: 'gpt-4o-mini'
     rerank_model?: string;        // Default: falls back to expansion_model
     base_url?: string;            // Base URL for embeddings (OpenAI-compatible)
