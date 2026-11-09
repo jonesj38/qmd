@@ -1438,6 +1438,49 @@ describe("FTS Search", () => {
     }
   });
 
+  test("searchFTS does not report empty when the only explicit collection exceeds 5000 docs", async () => {
+    const store = await createTestStore();
+    const largeCollection = await createTestCollection({
+      pwd: "/path/large-source",
+      glob: "**/*.md",
+      name: "large-source",
+    });
+    const now = new Date().toISOString();
+
+    try {
+      const insertLargeCollection = store.db.transaction(() => {
+        for (let i = 0; i < 5001; i++) {
+          const hash = `large-source-${i}`;
+          insertContent(store.db, hash, `ordinary large source document ${i}`, now);
+          insertDocument(
+            store.db,
+            largeCollection,
+            `source/${i}.md`,
+            `Large Source ${i}`,
+            hash,
+            now,
+            now,
+          );
+        }
+      });
+      insertLargeCollection();
+      await insertTestDocument(store.db, largeCollection, {
+        name: "selected",
+        hash: "large-source-selected",
+        title: "Lifecycle Governance Canary",
+        body: "terminal rejected history is governance evidence, not operational debt",
+        displayPath: "selected.md",
+      });
+
+      const results = store.searchFTS("terminal rejected history", 5, largeCollection);
+
+      expect(results).toHaveLength(1);
+      expect(results[0]?.filepath).toBe(`qmd://${largeCollection}/selected.md`);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
   test("searchFTS exact-filters collection token prefix collisions", async () => {
     const store = await createTestStore();
     const targetCollection = await createTestCollection({ pwd: "/path/foo", glob: "**/*.md", name: "foo" });

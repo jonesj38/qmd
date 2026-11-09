@@ -4072,12 +4072,16 @@ function hasScopedFtsCollectionPrefixCollision(db: Database, collection: string)
 function searchScopedFts(db: Database, ftsQuery: string, collections: string[], limit: number): SearchResult[] {
   if (limit <= 0) return [];
   const results: SearchResult[] = [];
-  for (const collection of collections) {
-    // An individually huge source collection can make BM25 ORDER BY consume the
-    // entire turn even with an indexed anchor. Skip only that collection; later
-    // small artifact/source collections retain their lexical contribution.
-    if (isScopedFtsCollectionOversized(db, collection)) continue;
-
+  const boundedCollections = collections.filter(
+    collection => !isScopedFtsCollectionOversized(db, collection),
+  );
+  // Prefer bounded collections when a mixed source/artifact set is requested.
+  // If every explicitly selected collection is large, searching none is a
+  // false-success retrieval result: targeted updates can complete while source
+  // authority becomes undiscoverable. In that case honor the explicit scope;
+  // callers retain their own query deadline as the fail-closed bound.
+  const searchableCollections = boundedCollections.length > 0 ? boundedCollections : collections;
+  for (const collection of searchableCollections) {
     if (!hasScopedFtsCollectionPrefixCollision(db, collection)) {
       const matches = getScopedFtsMatches(db, ftsQuery, collection, limit, 0);
       results.push(...hydrateFtsMatches(db, matches, limit, collection));
