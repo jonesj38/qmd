@@ -2636,6 +2636,7 @@ describe("Index Status", () => {
       expect(identity.model.revision).toBe("commit-a");
       expect(identity.dimensions).toBe(768);
       expect(identity.quantization).toBe("Q8_0");
+      expect(identity.preprocessing.chunking.revision).toBe(1);
 
       setEmbeddingConfig({ provider: "local", identity: { revision: "commit-b", dimensions: 768 } });
       expect(getEmbeddingFingerprint(model)).not.toBe(local);
@@ -4149,7 +4150,7 @@ describe("Embedding batching", () => {
         expect.any(Array), { isQuery: true },
       );
       expect(store.searchVecBatch).toHaveBeenCalledWith(
-        [[1, 2, 3]], 5, ["artifact"],
+        [[1, 2, 3]], 5, ["artifact"], "openai-test-model",
       );
       expect(store.searchVec).not.toHaveBeenCalled();
     } finally {

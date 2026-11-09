@@ -82,7 +82,7 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, getDefaultEmbeddingLLM, getEmbeddingConfig, withLLMSession, pullModels, setEmbeddingConfig, isUsingOpenAI, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, getDefaultEmbeddingLLM, getEmbeddingConfig, withEmbeddingSession, withLLMSession, pullModels, setEmbeddingConfig, isUsingOpenAI, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -3896,7 +3896,11 @@ async function checkEmbeddingVectorSamples(db: Database, model: string, fingerpr
   const threshold = 0.0001;
   const mismatches: string[] = [];
 
-  await withLLMSession(async (session) => {
+  // Match the provider-aware session used by the real embedding pipeline.
+  // `withLLMSession` always opens the local llama.cpp embedder; using it while
+  // QMD_OPENAI=1 compares 768d local vectors with 1536d OpenAI rows and reports
+  // a misleading Infinity distance even when stored vectors are healthy.
+  await withEmbeddingSession(async (session) => {
     for (const sample of samples) {
       const hashSeq = `${sample.hash}_${sample.seq}`;
       const chunks = await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal);

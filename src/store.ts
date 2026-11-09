@@ -135,6 +135,8 @@ export type EmbeddingIdentity = {
     document: string;
     chunking: {
       strategy: "token-aware-regex-or-ast";
+      /** Bump whenever chunk selection/ordering semantics change. */
+      revision: number;
       sizeTokens: number;
       overlapTokens: number;
       breakpointWindowTokens: number;
@@ -219,6 +221,10 @@ export function getEmbeddingIdentity(model: string = DEFAULT_EMBED_MODEL): Embed
       document: formatDocForEmbedding(EMBED_FINGERPRINT_PROBE_DOC, EMBED_FINGERPRINT_PROBE_TITLE, model),
       chunking: {
         strategy: "token-aware-regex-or-ast",
+        // Content-vector rows are keyed by hash/sequence. Include an explicit
+        // implementation revision so chunk-boundary or ordering changes cannot
+        // leave apparently-current vectors attached to different chunk text.
+        revision: 1,
         sizeTokens: CHUNK_SIZE_TOKENS,
         overlapTokens: CHUNK_OVERLAP_TOKENS,
         breakpointWindowTokens: CHUNK_WINDOW_TOKENS,
@@ -1819,12 +1825,15 @@ function claimPendingEmbeddingDocs(
     insert.run(doc.hash, model, fingerprint, owner, nowMs, expiresAt);
   }
 
-  const placeholders = docs.map(() => "?").join(",");
+  // `owner` is a fresh UUID-scoped value for this embedding run, so every
+  // claim returned for it was inserted by the loop above. Do not repeat the
+  // entire pending hash set in an `IN (...)` clause: large collections can
+  // exceed SQLite's bound-variable limit before document batching begins.
   const claimed = db.prepare(`
     SELECT hash
     FROM embedding_claims
-    WHERE owner = ? AND model = ? AND embed_fingerprint = ? AND hash IN (${placeholders})
-  `).all(owner, model, fingerprint, ...docs.map(doc => doc.hash)) as { hash: string }[];
+    WHERE owner = ? AND model = ? AND embed_fingerprint = ?
+  `).all(owner, model, fingerprint) as { hash: string }[];
   const claimedHashes = new Set(claimed.map(row => row.hash));
   return docs.filter(doc => claimedHashes.has(doc.hash));
 }
@@ -5943,7 +5952,7 @@ export async function vectorSearchQuery(
     (embedding): embedding is number[] => !!embedding,
   ) ?? [];
   const openAIResultSets = openAI
-    ? store.searchVecBatch(openAIEmbeddings, limit, collection)
+    ? store.searchVecBatch(openAIEmbeddings, limit, collection, embedModel)
     : [];
   let openAIResultIndex = 0;
 
