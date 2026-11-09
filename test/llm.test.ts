@@ -32,7 +32,8 @@ import {
 
 describe("embedding model contracts", () => {
   test("gte-modernbert uses prefix-free query and document text", () => {
-    const model = "hf:cstr/gte-modernbert-base-GGUF/gte-modernbert-base-q8_0.gguf";
+    const model =
+      "hf:ChrisGVE/gte-modernbert-base-Q8_0-GGUF/gte-modernbert-base-Q8_0.gguf";
     expect(formatQueryForEmbedding("find auth", model)).toBe("find auth");
     expect(formatDocForEmbedding("body", "Title", model)).toBe("Title\nbody");
   });

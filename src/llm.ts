@@ -271,7 +271,8 @@ export type RerankDocument = {
 // Override via QMD_EMBED_MODEL env var (e.g. hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf)
 const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
 export const CPU_EMBED_MODEL_PRESETS = {
-  "quality-cpu": "hf:cstr/gte-modernbert-base-GGUF/gte-modernbert-base-q8_0.gguf",
+  "quality-cpu":
+    "hf:ChrisGVE/gte-modernbert-base-Q8_0-GGUF/gte-modernbert-base-Q8_0.gguf",
   "fast-cpu": "hf:ggml-org/bge-small-en-v1.5-Q8_0-GGUF/bge-small-en-v1.5-q8_0.gguf",
   embeddinggemma: DEFAULT_EMBED_MODEL,
 } as const;

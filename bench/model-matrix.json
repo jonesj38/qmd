@@ -31,11 +31,11 @@
     {
       "id": "quality-cpu",
       "provider": "local",
-      "model": "hf:cstr/gte-modernbert-base-GGUF/gte-modernbert-base-q8_0.gguf",
-      "identity_reference": "file:gte-modernbert-base-q8_0.gguf",
-      "revision": "3ab6878f7bdf655265a49adb56f48f73d3c640a9",
-      "artifact_sha256": "581c00ab554bb740e5b454c029e6e278c22c20cfe4c7905f4313d8f452b15cb6",
-      "artifact_size_bytes": 159660096,
+      "model": "hf:ChrisGVE/gte-modernbert-base-Q8_0-GGUF/gte-modernbert-base-Q8_0.gguf",
+      "identity_reference": "file:gte-modernbert-base-Q8_0.gguf",
+      "revision": "635457715e59347f0a2bb90c76ab665c90baca29",
+      "artifact_sha256": "ddae471b78b3380e3e0db99b14ca588428b6592d3df9f6b3d571359087ae8c1f",
+      "artifact_size_bytes": 160208064,
       "full_supported": true
     },
     {
